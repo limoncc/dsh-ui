@@ -114,6 +114,15 @@ pub fn is_allowed_navigation(url: &str, port: Option<u16>) -> bool {
     rest[..authority_end].parse::<u16>() == Ok(port)
 }
 
+/// 把页面检测到的主题归一化为 "light"/"dark"；未知值按 light 处理。
+pub fn normalize_theme(theme: &str) -> &'static str {
+    if theme == "dark" {
+        "dark"
+    } else {
+        "light"
+    }
+}
+
 /// 按 PATH 与 GUI 常见目录探测 dsh 与 node，并校验 node 版本。
 pub fn detect_environment(path_env: Option<&str>) -> EnvCheck {
     let fallbacks: Vec<PathBuf> = EXTRA_BIN_DIRS.iter().map(PathBuf::from).collect();
@@ -665,6 +674,14 @@ mod tests {
         assert!(!is_allowed_navigation("http://localhost:64898/", Some(64898)));
         assert!(!is_allowed_navigation("file:///etc/passwd", Some(64898)));
         assert!(!is_allowed_navigation("http://127.0.0.1:port/", Some(64898)));
+    }
+
+    #[test]
+    fn normalize_theme_maps_unknown_to_light() {
+        assert_eq!(normalize_theme("dark"), "dark");
+        assert_eq!(normalize_theme("light"), "light");
+        assert_eq!(normalize_theme("Dark"), "light");
+        assert_eq!(normalize_theme(""), "light");
     }
 }
 

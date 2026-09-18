@@ -4,24 +4,21 @@
     <meta charset="UTF-8" />
     <title>正在启动</title>
     <style>
-      :root {
-        color-scheme: light dark;
-      }
       body {
+        --bg: #f5f5f7;
+        --fg: #1d1d1f;
         font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
         display: flex;
         align-items: center;
         justify-content: center;
         height: 100vh;
         margin: 0;
-        background: #f5f5f7;
-        color: #1d1d1f;
+        background: var(--bg);
+        color: var(--fg);
       }
-      @media (prefers-color-scheme: dark) {
-        body {
-          background: #1e1e20;
-          color: #f5f5f7;
-        }
+      body.dark {
+        --bg: #1e1e20;
+        --fg: #f5f5f7;
       }
       .box {
         text-align: center;
@@ -53,6 +50,10 @@
     </div>
     <script>
       const T = window.__TAURI__;
+      function setTheme(theme) {
+        document.body.classList.toggle('dark', theme === 'dark');
+      }
+      setTheme(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
       if (T) {
         T.event.listen('dsh://state', (event) => {
           const state = event.payload;
@@ -65,6 +66,7 @@
             hintEl.textContent = '修复问题后，从底部状态条重启，或退出应用重新打开。';
           }
         });
+        T.event.listen('theme-changed', (event) => setTheme(event.payload.theme));
         T.core.invoke('get_dsh_state').then((state) => {
           if (state.status === 'error' || state.status === 'stopped') {
             document.getElementById('error').textContent = state.error || '';

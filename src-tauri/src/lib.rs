@@ -5,10 +5,53 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::webview::WebviewBuilder;
 use tauri::window::WindowBuilder;
-use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl};
+use tauri::{Emitter, Listener, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl};
 
 /// 底部状态条高度（逻辑像素）。
 const BAR_HEIGHT: f64 = 36.0;
+
+/// 注入 dsh 页面：检测网页明暗主题并回报给壳（移植自 deepseek_app）。
+const THEME_DETECT_SCRIPT: &str = r#"
+(function(){
+    function getTheme(){
+        var el;
+        el=document.documentElement;
+        if(el){
+            if(el.classList.contains('dark'))return'dark';
+            var a=el.getAttribute('data-theme');
+            if(a==='dark')return'dark';
+            a=el.getAttribute('data-color-scheme');
+            if(a==='dark')return'dark';
+            a=el.getAttribute('data-mode');
+            if(a==='dark')return'dark';
+            if(el.hasAttribute('dark'))return'dark';
+        }
+        el=document.body;
+        if(el){
+            for(var i=0;i<el.classList.length;i++){
+                var c=el.classList[i];
+                if(c==='dark')return'dark';
+                if(c==='light')return'light';
+            }
+        }
+        return'light';
+    }
+    function report(t){
+        try{window.__TAURI_INTERNALS__.invoke('report_theme',{theme:t}).catch(function(){})}catch(e){}
+        try{window.__TAURI_INTERNALS__.emit('theme-changed',{theme:t})}catch(e){}
+    }
+    function setup(){
+        report(getTheme());
+        var cb=function(){report(getTheme())},opts={attributes:true,attributeFilter:['class','data-theme','data-color-scheme','data-mode','style'],subtree:false};
+        [document.documentElement,document.body].filter(Boolean).forEach(function(n){
+            new MutationObserver(cb).observe(n,opts);
+        });
+    }
+    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',setup);
+    else setup();
+    var n=0,i=setInterval(function(){report(getTheme());if(++n>=20)clearInterval(i)},500);
+})();
+"#;
 
 /// dsh 启动就绪的最长等待时间；可用 `DSH_UI_BOOT_TIMEOUT` 环境变量覆盖（秒）。
 const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 30;
@@ -31,6 +74,51 @@ struct AppState {
 #[tauri::command]
 fn get_dsh_state(state: State<'_, AppState>) -> DshState {
     state.state.lock().unwrap().clone()
+}
+
+/// Tauri 命令：dsh 页面的主题检测脚本经此回报主题变化。
+#[tauri::command]
+fn report_theme(app: tauri::AppHandle, theme: String) {
+    let normalized = dsh::normalize_theme(&theme).to_string();
+    let handle = app.clone();
+    let callback = handle.clone();
+    let _ = handle.run_on_main_thread(move || apply_window_theme(&callback, &normalized));
+}
+
+/// 让 macOS 窗口原生外观（材质与 NSAppearance）跟随 dsh 页面主题，
+/// 并广播给 bar/loading 页面切换配色。必须在主线程调用。
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+fn apply_window_theme(app: &tauri::AppHandle, theme: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSApp, NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+        use tauri::window::{Color, Effect, EffectState, EffectsBuilder};
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let dark = theme == "dark";
+        if let Some(window) = app.get_window("main") {
+            let effects = EffectsBuilder::new()
+                .effect(if dark { Effect::Sidebar } else { Effect::ContentBackground })
+                .state(EffectState::Active)
+                .radius(0.0)
+                .color(if dark { Color(0, 0, 0, 255) } else { Color(255, 255, 255, 255) })
+                .build();
+            let _ = window.set_effects(effects);
+        }
+        // objc2 新版把 extern static 与部分 FFI 声明标为 safe：仅 static 访问需要 unsafe。
+        let name = if dark {
+            unsafe { NSAppearanceNameDarkAqua }
+        } else {
+            unsafe { NSAppearanceNameAqua }
+        };
+        if let Some(appearance) = NSAppearance::appearanceNamed(name) {
+            NSApp(mtm).setAppearance(Some(&appearance));
+        }
+    }
+    let _ = app.emit("theme-changed", serde_json::json!({ "theme": theme }));
 }
 
 fn set_status(app: &tauri::AppHandle, status: &str, url: Option<String>, error: Option<String>) {
@@ -148,6 +236,7 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
     let app_handle = app.handle().clone();
     let content = WebviewBuilder::new("content", WebviewUrl::App("loading.html".into()))
         .auto_resize()
+        .initialization_script(THEME_DETECT_SCRIPT)
         .on_navigation(move |url| {
             let allowed = dsh::is_allowed_navigation(
                 url.as_str(),
@@ -189,9 +278,26 @@ pub fn run() {
             state: Mutex::new(DshState::default()),
             dsh_port: Mutex::new(None),
         })
-        .invoke_handler(tauri::generate_handler![get_dsh_state])
+        .invoke_handler(tauri::generate_handler![get_dsh_state, report_theme])
         .setup(|app| {
             build_main_window(app)?;
+            // 页面 emit 的主题事件（fallback 通道）：主线程应用原生外观。
+            let handle = app.handle().clone();
+            app.listen("theme-changed", move |event| {
+                let payload: serde_json::Value =
+                    serde_json::from_str(event.payload()).unwrap_or_default();
+                let theme = payload
+                    .get("theme")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("light")
+                    .to_string();
+                let normalized = dsh::normalize_theme(&theme).to_string();
+                let callback = handle.clone();
+                let _ = handle.run_on_main_thread(move || {
+                    apply_window_theme(&callback, &normalized);
+                });
+            });
+            apply_window_theme(app.handle(), "light");
             start_dsh(app.handle());
             Ok(())
         })

@@ -4,10 +4,11 @@
     <meta charset="UTF-8" />
     <title>dsh-ui 状态条</title>
     <style>
-      :root {
-        color-scheme: light dark;
-      }
       body {
+        --bg: #f5f5f7;
+        --fg: #3a3a3c;
+        --line: rgba(0, 0, 0, 0.15);
+        --btn-bg: rgba(255, 255, 255, 0.6);
         margin: 0;
         height: 100vh;
         display: flex;
@@ -15,23 +16,18 @@
         justify-content: space-between;
         padding: 0 12px;
         box-sizing: border-box;
-        background: #f5f5f7;
-        color: #3a3a3c;
+        background: var(--bg);
+        color: var(--fg);
         font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
         font-size: 12px;
         user-select: none;
         -webkit-user-select: none;
       }
-      @media (prefers-color-scheme: dark) {
-        body {
-          background: #28282a;
-          color: #d1d1d6;
-        }
-        button {
-          background: rgba(255, 255, 255, 0.08) !important;
-          border-color: rgba(255, 255, 255, 0.18) !important;
-          color: #d1d1d6 !important;
-        }
+      body.dark {
+        --bg: #28282a;
+        --fg: #d1d1d6;
+        --line: rgba(255, 255, 255, 0.18);
+        --btn-bg: rgba(255, 255, 255, 0.08);
       }
       .status {
         display: flex;
@@ -54,9 +50,10 @@
       button {
         font-size: 12px;
         padding: 3px 10px;
-        border: 1px solid rgba(0, 0, 0, 0.15);
+        border: 1px solid var(--line);
         border-radius: 6px;
-        background: rgba(255, 255, 255, 0.6);
+        background: var(--btn-bg);
+        color: var(--fg);
         cursor: pointer;
       }
     </style>
@@ -79,8 +76,13 @@
         document.getElementById('dot').className = 'dot ' + state.status;
         document.getElementById('text').textContent = LABELS[state.status] || state.status;
       }
+      function setTheme(theme) {
+        document.body.classList.toggle('dark', theme === 'dark');
+      }
+      setTheme(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
       if (T) {
         T.event.listen('dsh://state', (event) => apply(event.payload));
+        T.event.listen('theme-changed', (event) => setTheme(event.payload.theme));
         T.core.invoke('get_dsh_state').then(apply).catch(() => {});
         document.getElementById('terminal').addEventListener('click', () => {
           T.core.invoke('open_terminal').catch(() => {});
