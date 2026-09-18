@@ -92,7 +92,7 @@
       setTheme(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
       if (T) {
         T.event.listen('dsh://state', (event) => apply(event.payload));
-        T.event.listen('theme-changed', (event) => setTheme(event.payload.theme));
+        T.event.listen('dsh://theme', (event) => setTheme(event.payload.theme));
         T.core.invoke('get_dsh_state').then(apply).catch(() => {});
         document.getElementById('terminal').addEventListener('click', () => {
           T.core.invoke('open_terminal').catch(() => {});

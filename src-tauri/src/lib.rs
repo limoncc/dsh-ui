@@ -260,7 +260,9 @@ fn apply_window_theme(app: &tauri::AppHandle, theme: &str) {
             NSApp(mtm).setAppearance(Some(&appearance));
         }
     }
-    let _ = app.emit("theme-changed", serde_json::json!({ "theme": theme }));
+    // 注意：广播给壳页面用独立事件名——若也用 "theme-changed"，后端 emit
+    // 会被自己的 listener 再次收到，形成无限循环。
+    let _ = app.emit("dsh://theme", serde_json::json!({ "theme": theme }));
 }
 
 fn set_status(app: &tauri::AppHandle, status: &str, url: Option<String>, error: Option<String>) {
@@ -673,7 +675,8 @@ pub fn run() {
                 build_menu(app)?;
                 build_tray(app)?;
             }
-            // 页面 emit 的主题事件（fallback 通道）：主线程应用原生外观。
+            // 页面 emit 的主题事件（检测脚本经 invoke/emit 双通道回报）：
+            // 主线程应用原生外观。此处只收页面→后端方向的 "theme-changed"。
             let handle = app.handle().clone();
             app.listen("theme-changed", move |event| {
                 let payload: serde_json::Value =

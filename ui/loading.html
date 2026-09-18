@@ -66,7 +66,7 @@
             hintEl.textContent = '修复问题后，从底部状态条重启，或退出应用重新打开。';
           }
         });
-        T.event.listen('theme-changed', (event) => setTheme(event.payload.theme));
+        T.event.listen('dsh://theme', (event) => setTheme(event.payload.theme));
         T.core.invoke('get_dsh_state').then((state) => {
           if (state.status === 'error' || state.status === 'stopped') {
             document.getElementById('error').textContent = state.error || '';
