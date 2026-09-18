@@ -158,6 +158,15 @@ fn get_dsh_state(state: State<'_, AppState>) -> DshState {
     state.state.lock().unwrap().clone()
 }
 
+/// Tauri 命令：重启 dsh（停止旧进程后重新探测并 spawn）。
+#[tauri::command]
+fn restart_dsh(app: tauri::AppHandle) {
+    if let Some(process) = app.state::<AppState>().process.lock().unwrap().take() {
+        process.stop();
+    }
+    start_dsh(&app);
+}
+
 /// Tauri 命令：dsh 页面的主题检测脚本经此回报主题变化。
 #[tauri::command]
 fn report_theme(app: tauri::AppHandle, theme: String) {
@@ -497,7 +506,11 @@ pub fn run() {
             }
             _ => {}
         })
-        .invoke_handler(tauri::generate_handler![get_dsh_state, report_theme])
+        .invoke_handler(tauri::generate_handler![
+            get_dsh_state,
+            report_theme,
+            restart_dsh
+        ])
         .setup(|app| {
             build_main_window(app)?;
             #[cfg(target_os = "macos")]

@@ -34,6 +34,10 @@
         align-items: center;
         gap: 6px;
       }
+      .actions {
+        display: flex;
+        gap: 6px;
+      }
       .dot {
         width: 8px;
         height: 8px;
@@ -63,7 +67,10 @@
       <span class="dot" id="dot"></span>
       <span id="text">启动中…</span>
     </div>
-    <button id="terminal" title="在窗口下方打开系统终端">终端</button>
+    <div class="actions">
+      <button id="restart" hidden title="重新启动 dsh 后端">重启</button>
+      <button id="terminal" title="在窗口下方打开系统终端">终端</button>
+    </div>
     <script>
       const T = window.__TAURI__;
       const LABELS = {
@@ -75,6 +82,8 @@
       function apply(state) {
         document.getElementById('dot').className = 'dot ' + state.status;
         document.getElementById('text').textContent = LABELS[state.status] || state.status;
+        document.getElementById('restart').hidden =
+          state.status === 'ready' || state.status === 'starting';
       }
       function setTheme(theme) {
         document.body.classList.toggle('dark', theme === 'dark');
@@ -86,6 +95,9 @@
         T.core.invoke('get_dsh_state').then(apply).catch(() => {});
         document.getElementById('terminal').addEventListener('click', () => {
           T.core.invoke('open_terminal').catch(() => {});
+        });
+        document.getElementById('restart').addEventListener('click', () => {
+          T.core.invoke('restart_dsh').catch(() => {});
         });
       }
     </script>
