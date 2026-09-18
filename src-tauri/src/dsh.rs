@@ -68,6 +68,30 @@ pub fn child_path(dirs: &[PathBuf], inherited: Option<&str>) -> String {
     parts.join(":")
 }
 
+/// dsh 就绪行的固定前缀（`packages/bundle/web-app` announceReady 打印）。
+pub const READY_LINE_PREFIX: &str = "dsh web: ";
+
+/// 从一行 stdout 中解析 dsh 的就绪 URL（带 launch token）。
+///
+/// 就绪行形如 `dsh web: http://127.0.0.1:<port>/?token=<token>`，
+/// 行尾可能带 ` (LAN: ...)` 后缀。仅接受 http、loopback、含非空 token 的
+/// 首个空白分隔 token，避免误吞散文行或异常地址。
+pub fn parse_ready_line(line: &str) -> Option<String> {
+    const LOOPBACK_PREFIX: &str = "http://127.0.0.1:";
+    const TOKEN_MARK: &str = "/?token=";
+
+    let rest = line.trim_end_matches(['\r', '\n']).strip_prefix(READY_LINE_PREFIX)?;
+    let candidate = rest.split_whitespace().next()?;
+    let token_at = candidate.find(TOKEN_MARK)?;
+    let authority = candidate[..token_at].strip_prefix(LOOPBACK_PREFIX)?;
+    // 端口必须是非空数字串（dsh 打印的是实际监听端口）。
+    if authority.is_empty() || !authority.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let token = &candidate[token_at + TOKEN_MARK.len()..];
+    (!token.is_empty()).then(|| candidate.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +237,61 @@ mod tests {
     fn child_path_without_inherited_is_probe_dirs_only() {
         let dirs = vec![PathBuf::from("/usr/local/bin")];
         assert_eq!(child_path(&dirs, None), "/usr/local/bin");
+    }
+
+    #[test]
+    fn parse_ready_line_reads_standard_line() {
+        let line = "dsh web: http://127.0.0.1:41234/?token=abc123";
+        assert_eq!(parse_ready_line(line), Some("http://127.0.0.1:41234/?token=abc123".to_string()));
+    }
+
+    #[test]
+    fn parse_ready_line_takes_first_url_before_lan_suffix() {
+        let line = "dsh web: http://127.0.0.1:41234/?token=t (LAN: http://192.168.1.5:41234/?token=t)";
+        assert_eq!(parse_ready_line(line), Some("http://127.0.0.1:41234/?token=t".to_string()));
+    }
+
+    #[test]
+    fn parse_ready_line_rejects_prose_line() {
+        assert_eq!(
+            parse_ready_line("dsh web: opening the default browser; pass --no-open to disable"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_ready_line_rejects_non_loopback_host() {
+        assert_eq!(parse_ready_line("dsh web: http://192.168.1.5:3080/?token=t"), None);
+    }
+
+    #[test]
+    fn parse_ready_line_rejects_non_http_scheme() {
+        assert_eq!(parse_ready_line("dsh web: https://127.0.0.1:3080/?token=t"), None);
+    }
+
+    #[test]
+    fn parse_ready_line_rejects_missing_or_empty_token() {
+        assert_eq!(parse_ready_line("dsh web: http://127.0.0.1:3080/"), None);
+        assert_eq!(parse_ready_line("dsh web: http://127.0.0.1:3080/?token="), None);
+    }
+
+    #[test]
+    fn parse_ready_line_rejects_non_numeric_port() {
+        assert_eq!(parse_ready_line("dsh web: http://127.0.0.1:port/?token=t"), None);
+    }
+
+    #[test]
+    fn parse_ready_line_rejects_plain_log_lines() {
+        assert_eq!(parse_ready_line("[loader] mounted plugin"), None);
+        assert_eq!(parse_ready_line(""), None);
+        assert_eq!(parse_ready_line("dsh web:"), None);
+    }
+
+    #[test]
+    fn parse_ready_line_tolerates_trailing_newline() {
+        assert_eq!(
+            parse_ready_line("dsh web: http://127.0.0.1:1/?token=t\r\n"),
+            Some("http://127.0.0.1:1/?token=t".to_string())
+        );
     }
 }
