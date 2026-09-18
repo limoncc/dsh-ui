@@ -1,3 +1,5 @@
+pub mod dsh;
+
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
