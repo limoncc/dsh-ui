@@ -69,6 +69,7 @@
     </div>
     <div class="actions">
       <button id="restart" hidden title="重新启动 dsh 后端">重启</button>
+      <button id="logs" title="在 Finder 中显示日志目录">日志</button>
       <button id="terminal" title="在窗口下方打开系统终端">终端</button>
     </div>
     <script>
@@ -98,6 +99,9 @@
         });
         document.getElementById('restart').addEventListener('click', () => {
           T.core.invoke('restart_dsh').catch(() => {});
+        });
+        document.getElementById('logs').addEventListener('click', () => {
+          T.core.invoke('open_log_dir').catch(() => {});
         });
       }
     </script>

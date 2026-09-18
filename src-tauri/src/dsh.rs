@@ -194,6 +194,8 @@ pub struct DshConfig {
     pub boot_timeout: Duration,
     /// SIGTERM 后等待退出的宽限期，超时升级 SIGKILL。
     pub kill_grace: Duration,
+    /// dsh 的 stdout/stderr 日志落盘路径；None 则只收集尾部不落盘。
+    pub log_file: Option<PathBuf>,
 }
 
 impl DshConfig {
@@ -208,6 +210,7 @@ impl DshConfig {
             child_path,
             boot_timeout,
             kill_grace: Duration::from_secs(3),
+            log_file: log_dir().map(|dir| dir.join("dsh.log")),
         }
     }
 }
@@ -229,6 +232,8 @@ struct Shared {
     timeout_reported: AtomicBool,
     stop_requested: AtomicBool,
     exit_reported: AtomicBool,
+    /// stderr 尾部环形缓冲（错误页展示用）。
+    stderr_tail: Mutex<Vec<u8>>,
 }
 
 /// dsh 子进程句柄：spawn 后由内部线程驱动事件，`stop` 负责进程组终止。
@@ -266,12 +271,21 @@ impl DshProcess {
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
 
+        // 日志文件（truncate 每次启动）；目录不存在时放弃落盘，不影响运行。
+        let log_file = config.log_file.as_deref().and_then(|path| {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            std::fs::File::create(path).ok()
+        });
+
         let shared = Arc::new(Shared {
             child: Mutex::new(child),
             ready: AtomicBool::new(false),
             timeout_reported: AtomicBool::new(false),
             stop_requested: AtomicBool::new(false),
             exit_reported: AtomicBool::new(false),
+            stderr_tail: Mutex::new(Vec::new()),
         });
 
         // stdout 线程：解析就绪行；EOF 后等进程真正退出并报告一次。
@@ -296,13 +310,26 @@ impl DshProcess {
             });
         }
 
-        // stderr 线程：持续排空管道，防止子进程因缓冲写满而阻塞。
-        // TODO(日志循环): 收集尾部内容供错误页展示并落盘 ~/Library/Logs/dsh-ui/。
-        thread::spawn(move || {
-            for line in BufRead::lines(BufReader::new(stderr)).map_while(Result::ok) {
-                let _ = line;
-            }
-        });
+        // stderr 线程：排空管道防阻塞，同时收集尾部并全量落盘。
+        {
+            let shared = shared.clone();
+            thread::spawn(move || {
+                let mut log_file = log_file;
+                use std::io::Write;
+                for line in BufRead::lines(BufReader::new(stderr)).map_while(Result::ok) {
+                    if let Some(file) = log_file.as_mut() {
+                        let _ = writeln!(file, "{line}");
+                    }
+                    let mut tail = shared.stderr_tail.lock().unwrap();
+                    tail.extend_from_slice(line.as_bytes());
+                    tail.push(b'\n');
+                    let overflow = tail.len().saturating_sub(STDERR_TAIL_BYTES);
+                    if overflow > 0 {
+                        tail.drain(..overflow);
+                    }
+                }
+            });
+        }
 
         // 超时线程：boot_timeout 内未就绪则报告并终止子进程。
         {
@@ -339,6 +366,19 @@ impl DshProcess {
             .map(|status| status.is_none())
             .unwrap_or(true)
     }
+
+    /// stderr 尾部内容（最多 [`STDERR_TAIL_BYTES`] 字节），供错误页展示。
+    pub fn stderr_tail(&self) -> Vec<u8> {
+        self.shared.stderr_tail.lock().unwrap().clone()
+    }
+}
+
+/// stderr 尾部环形缓冲上限。
+pub const STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+/// dsh 日志目录：`~/Library/Logs/dsh-ui`（macOS 惯例，跟随 HOME）。
+pub fn log_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Logs/dsh-ui"))
 }
 
 fn request_stop(shared: &Arc<Shared>, pid: i32, kill_grace: Duration) {
@@ -383,22 +423,22 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    struct TempDir(PathBuf);
+    pub(super) struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new(tag: &str) -> Self {
+        pub(super) fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!("dsh-ui-test-{}-{}", tag, std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("create temp dir");
             TempDir(dir)
         }
 
-        fn path(&self) -> PathBuf {
+        pub(super) fn path(&self) -> PathBuf {
             self.0.clone()
         }
 
         /// 放置一个可执行文件并返回其路径。
-        fn executable(&self, name: &str) -> PathBuf {
+        pub(super) fn executable(&self, name: &str) -> PathBuf {
             let file = self.0.join(name);
             fs::write(&file, "#!/bin/sh\n").expect("write fake executable");
             fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -406,7 +446,7 @@ mod tests {
         }
 
         /// 放置一个不可执行文件并返回其路径。
-        fn plain_file(&self, name: &str) -> PathBuf {
+        pub(super) fn plain_file(&self, name: &str) -> PathBuf {
             let file = self.0.join(name);
             fs::write(&file, "not executable").expect("write plain file");
             file
@@ -687,6 +727,7 @@ mod tests {
 
 #[cfg(test)]
 mod process_tests {
+    use super::tests::TempDir;
     use super::{DshConfig, DshEvent, DshProcess};
     use std::path::PathBuf;
     use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
@@ -703,7 +744,54 @@ mod process_tests {
             child_path: None,
             boot_timeout: Duration::from_millis(150),
             kill_grace: Duration::from_millis(300),
+            log_file: None,
         }
+    }
+
+    #[test]
+    fn stderr_is_collected_to_tail_and_log_file() {
+        let dir = TempDir::new("stderr-log");
+        let log_path = dir.path().join("dsh.log");
+        let mut config = fake_config(
+            "echo 'boom' >&2; echo 'warning line' >&2; \
+             echo 'dsh web: http://127.0.0.1:45678/?token=t'; sleep 30",
+        );
+        config.log_file = Some(log_path.clone());
+        let (tx, rx) = channel();
+        let tx = Mutex::new(tx);
+        let process = DshProcess::spawn(config, Arc::new(move |event| {
+            let _ = tx.lock().unwrap().send(event);
+        }))
+        .expect("spawn fake dsh");
+
+        // 等就绪行出现（说明 stderr 行已被读入）。
+        assert_eq!(
+            next_event(&rx, Duration::from_secs(5)),
+            DshEvent::Ready { url: "http://127.0.0.1:45678/?token=t".to_string() }
+        );
+        let tail = String::from_utf8(process.stderr_tail()).expect("stderr tail utf8");
+        assert!(tail.contains("boom"), "tail 应包含 stderr 内容，实际：{tail:?}");
+        assert!(tail.contains("warning line"));
+        // 不包含 stdout 内容（就绪行走 stdout 不进 stderr tail）。
+        assert!(!tail.contains("token=t"));
+        process.stop();
+
+        let logged = std::fs::read_to_string(&log_path).expect("read log file");
+        assert!(logged.contains("boom") && logged.contains("warning line"));
+    }
+
+    #[test]
+    fn spawn_failure_returns_error() {
+        let config = DshConfig {
+            program: PathBuf::from("/nonexistent/dsh-binary-for-test"),
+            args: vec![],
+            child_path: None,
+            boot_timeout: Duration::from_millis(100),
+            kill_grace: Duration::from_millis(100),
+            log_file: None,
+        };
+        let result = DshProcess::spawn(config, Arc::new(|_event| {}));
+        assert!(result.is_err(), "expected spawn error for missing binary");
     }
 
     fn spawn_fake(script: &str) -> (DshProcess, Receiver<DshEvent>) {
@@ -792,18 +880,5 @@ mod process_tests {
             other => panic!("expected requested exit after escalation, got {other:?}"),
         }
         assert!(!process.is_running());
-    }
-
-    #[test]
-    fn spawn_failure_returns_error() {
-        let config = DshConfig {
-            program: PathBuf::from("/nonexistent/dsh-binary-for-test"),
-            args: vec![],
-            child_path: None,
-            boot_timeout: Duration::from_millis(100),
-            kill_grace: Duration::from_millis(100),
-        };
-        let result = DshProcess::spawn(config, Arc::new(|_event| {}));
-        assert!(result.is_err(), "expected spawn error for missing binary");
     }
 }

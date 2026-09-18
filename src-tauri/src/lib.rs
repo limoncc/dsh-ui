@@ -167,6 +167,14 @@ fn restart_dsh(app: tauri::AppHandle) {
     start_dsh(&app);
 }
 
+/// Tauri 命令：在 Finder 中显示 dsh 日志目录。
+#[tauri::command]
+fn open_log_dir() {
+    if let Some(dir) = dsh::log_dir() {
+        let _ = std::process::Command::new("open").arg("-R").arg(dir).spawn();
+    }
+}
+
 /// Tauri 命令：dsh 页面的主题检测脚本经此回报主题变化。
 #[tauri::command]
 fn report_theme(app: tauri::AppHandle, theme: String) {
@@ -234,6 +242,25 @@ fn boot_timeout_from_env() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// 取当前 dsh 进程 stderr 尾部（截到最后 ~2KB），附加到错误信息里。
+fn dsh_error_tail(app: &tauri::AppHandle) -> String {
+    let tail = app
+        .state::<AppState>()
+        .process
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|process| process.stderr_tail())
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&tail);
+    let bytes = text.as_bytes();
+    if bytes.len() > 2048 {
+        String::from_utf8_lossy(&bytes[bytes.len() - 2048..]).to_string()
+    } else {
+        text.to_string()
+    }
+}
+
 fn handle_dsh_event(app: &tauri::AppHandle, event: dsh::DshEvent) {
     match event {
         dsh::DshEvent::Ready { url } => {
@@ -247,10 +274,22 @@ fn handle_dsh_event(app: &tauri::AppHandle, event: dsh::DshEvent) {
             }
         }
         dsh::DshEvent::BootTimeout => {
-            set_status(app, "error", None, Some("dsh 启动超时，请重试或查看日志。".to_string()))
+            let tail = dsh_error_tail(app);
+            set_status(
+                app,
+                "error",
+                None,
+                Some(format!("dsh 启动超时。最近日志：\n{tail}")),
+            )
         }
         dsh::DshEvent::Exited { requested: false, .. } => {
-            set_status(app, "stopped", None, Some("dsh 进程已退出。".to_string()))
+            let tail = dsh_error_tail(app);
+            set_status(
+                app,
+                "stopped",
+                None,
+                Some(format!("dsh 进程已退出。最近日志：\n{tail}")),
+            )
         }
         dsh::DshEvent::Exited { requested: true, .. } => {}
     }
@@ -509,7 +548,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_dsh_state,
             report_theme,
-            restart_dsh
+            restart_dsh,
+            open_log_dir
         ])
         .setup(|app| {
             build_main_window(app)?;
