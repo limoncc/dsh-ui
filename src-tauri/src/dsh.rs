@@ -3,7 +3,12 @@
 //! 所有可单测的决策都以纯函数呈现；进程管理通过注入配置实现，
 //! 集成测试用假 dsh 脚本替代真实 CLI。
 
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// dsh 要求的最低 Node.js major 版本（用到 `node:sqlite` 等）。
 pub const MIN_NODE_MAJOR: u32 = 22;
@@ -90,6 +95,200 @@ pub fn parse_ready_line(line: &str) -> Option<String> {
     }
     let token = &candidate[token_at + TOKEN_MARK.len()..];
     (!token.is_empty()).then(|| candidate.to_string())
+}
+
+/// dsh 子进程的启动配置；测试注入假脚本，生产用 [`DshConfig::real`]。
+#[derive(Debug, Clone)]
+pub struct DshConfig {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    /// 子进程 PATH（GUI 环境需显式携带探测到的 dsh/node 目录）。
+    pub child_path: Option<String>,
+    /// 等待就绪行的最长时间，超时报告 [`DshEvent::BootTimeout`] 并终止子进程。
+    pub boot_timeout: Duration,
+    /// SIGTERM 后等待退出的宽限期，超时升级 SIGKILL。
+    pub kill_grace: Duration,
+}
+
+impl DshConfig {
+    /// 生产配置：spawn 探测到的 dsh CLI，`--port 0` 由 OS 选空闲端口。
+    pub fn real(dsh: &Path, child_path: Option<String>, boot_timeout: Duration) -> Self {
+        DshConfig {
+            program: dsh.to_path_buf(),
+            args: ["web", "--no-open", "--port", "0"]
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect(),
+            child_path,
+            boot_timeout,
+            kill_grace: Duration::from_secs(3),
+        }
+    }
+}
+
+/// dsh 子进程向壳报告的运行事件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DshEvent {
+    /// stdout 出现就绪行，url 为带 launch token 的完整地址。
+    Ready { url: String },
+    /// 启动超时（未在 boot_timeout 内看到就绪行）。
+    BootTimeout,
+    /// 进程退出；requested 表示是否由本 APP 主动停止（区别于崩溃）。
+    Exited { exit_code: Option<i32>, requested: bool },
+}
+
+struct Shared {
+    child: Mutex<std::process::Child>,
+    ready: AtomicBool,
+    timeout_reported: AtomicBool,
+    stop_requested: AtomicBool,
+    exit_reported: AtomicBool,
+}
+
+/// dsh 子进程句柄：spawn 后由内部线程驱动事件，`stop` 负责进程组终止。
+#[derive(Clone)]
+pub struct DshProcess {
+    shared: Arc<Shared>,
+    pid: i32,
+    kill_grace: Duration,
+}
+
+impl DshProcess {
+    pub fn spawn(
+        config: DshConfig,
+        on_event: Arc<dyn Fn(DshEvent) + Send + Sync>,
+    ) -> std::io::Result<Self> {
+        let mut command = std::process::Command::new(&config.program);
+        command.args(&config.args);
+        if let Some(path) = &config.child_path {
+            command.env("PATH", path);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // 独立进程组：退出时可整组终止 dsh 及其子进程。
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        let mut child = command.spawn()?;
+        // process_group(0) 使子进程成为新组长：pgid == pid，整组 kill 用 -pid。
+        let pid = child.id() as i32;
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+
+        let shared = Arc::new(Shared {
+            child: Mutex::new(child),
+            ready: AtomicBool::new(false),
+            timeout_reported: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+            exit_reported: AtomicBool::new(false),
+        });
+
+        // stdout 线程：解析就绪行；EOF 后等进程真正退出并报告一次。
+        {
+            let shared = shared.clone();
+            let on_event = on_event.clone();
+            thread::spawn(move || {
+                for line in BufRead::lines(BufReader::new(stdout)).map_while(Result::ok) {
+                    if let Some(url) = parse_ready_line(&line) {
+                        if !shared.ready.swap(true, Ordering::SeqCst) {
+                            on_event(DshEvent::Ready { url });
+                        }
+                    }
+                }
+                let status = shared.child.lock().unwrap().wait();
+                if !shared.exit_reported.swap(true, Ordering::SeqCst) {
+                    on_event(DshEvent::Exited {
+                        exit_code: status.ok().and_then(|st| st.code()),
+                        requested: shared.stop_requested.load(Ordering::SeqCst),
+                    });
+                }
+            });
+        }
+
+        // stderr 线程：持续排空管道，防止子进程因缓冲写满而阻塞。
+        // TODO(日志循环): 收集尾部内容供错误页展示并落盘 ~/Library/Logs/dsh-ui/。
+        thread::spawn(move || {
+            for line in BufRead::lines(BufReader::new(stderr)).map_while(Result::ok) {
+                let _ = line;
+            }
+        });
+
+        // 超时线程：boot_timeout 内未就绪则报告并终止子进程。
+        {
+            let shared = shared.clone();
+            let on_event = on_event.clone();
+            let boot_timeout = config.boot_timeout;
+            let kill_grace = config.kill_grace;
+            thread::spawn(move || {
+                thread::sleep(boot_timeout);
+                if !shared.ready.load(Ordering::SeqCst)
+                    && !shared.timeout_reported.swap(true, Ordering::SeqCst)
+                {
+                    on_event(DshEvent::BootTimeout);
+                    request_stop(&shared, pid, kill_grace);
+                }
+            });
+        }
+
+        Ok(DshProcess { shared, pid, kill_grace: config.kill_grace })
+    }
+
+    /// 请求终止：SIGTERM 整个进程组，宽限期后升级 SIGKILL。幂等。
+    pub fn stop(&self) {
+        request_stop(&self.shared, self.pid, self.kill_grace);
+    }
+
+    /// 子进程是否仍在运行（探测失败时保守视为在运行）。
+    pub fn is_running(&self) -> bool {
+        self.shared
+            .child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .map(|status| status.is_none())
+            .unwrap_or(true)
+    }
+}
+
+fn request_stop(shared: &Arc<Shared>, pid: i32, kill_grace: Duration) {
+    if shared.stop_requested.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    kill_process_group(pid, libc::SIGTERM);
+    // 看门狗：宽限期内仍存活则升级 SIGKILL。
+    let probe = Arc::downgrade(shared);
+    thread::spawn(move || {
+        let deadline = Instant::now() + kill_grace;
+        loop {
+            let alive = probe
+                .upgrade()
+                .and_then(|shared| {
+                    shared
+                        .child
+                        .lock()
+                        .ok()
+                        .map(|mut child| child.try_wait().map_or(true, |st| st.is_none()))
+                })
+                .unwrap_or(false);
+            if !alive || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        kill_process_group(pid, libc::SIGKILL);
+    });
+}
+
+/// 向进程组发信号：组长 pid 取负即组 id；目标已死时 kill 返回 ESRCH，忽略。
+fn kill_process_group(pid: i32, sig: i32) {
+    unsafe {
+        libc::kill(-pid, sig);
+    }
 }
 
 #[cfg(test)]
@@ -293,5 +492,128 @@ mod tests {
             parse_ready_line("dsh web: http://127.0.0.1:1/?token=t\r\n"),
             Some("http://127.0.0.1:1/?token=t".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::{DshConfig, DshEvent, DshProcess};
+    use std::path::PathBuf;
+    use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const READY_URL: &str = "http://127.0.0.1:45678/?token=testtoken";
+    const READY_LINE: &str = "dsh web: http://127.0.0.1:45678/?token=testtoken";
+
+    fn fake_config(script: &str) -> DshConfig {
+        DshConfig {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), script.to_string()],
+            child_path: None,
+            boot_timeout: Duration::from_millis(150),
+            kill_grace: Duration::from_millis(300),
+        }
+    }
+
+    fn spawn_fake(script: &str) -> (DshProcess, Receiver<DshEvent>) {
+        let (tx, rx) = channel();
+        let tx = Mutex::new(tx);
+        let process = DshProcess::spawn(
+            fake_config(script),
+            Arc::new(move |event| {
+                let _ = tx.lock().unwrap().send(event);
+            }),
+        )
+        .expect("spawn fake dsh");
+        (process, rx)
+    }
+
+    fn next_event(rx: &Receiver<DshEvent>, timeout: Duration) -> DshEvent {
+        match rx.recv_timeout(timeout) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => panic!("timed out waiting for event"),
+            Err(RecvTimeoutError::Disconnected) => panic!("event channel closed"),
+        }
+    }
+
+    #[test]
+    fn ready_url_is_reported_once_for_repeated_lines() {
+        let (process, rx) =
+            spawn_fake(&format!("echo '{READY_LINE}'; echo '{READY_LINE}'; sleep 30"));
+        assert_eq!(
+            next_event(&rx, Duration::from_secs(5)),
+            DshEvent::Ready { url: READY_URL.to_string() }
+        );
+        // 就绪行重复出现不重复上报：500ms 内不应再有事件。
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_millis(500)), Err(RecvTimeoutError::Timeout)),
+            "unexpected extra event after Ready"
+        );
+        process.stop();
+    }
+
+    #[test]
+    fn boot_timeout_is_reported_when_no_ready_line() {
+        let (process, rx) = spawn_fake("echo 'still booting'; sleep 5");
+        assert_eq!(next_event(&rx, Duration::from_secs(2)), DshEvent::BootTimeout);
+        process.stop();
+    }
+
+    #[test]
+    fn immediate_exit_is_reported_with_code_and_not_requested() {
+        let (_process, rx) = spawn_fake("echo 'goodbye'; exit 0");
+        assert_eq!(
+            next_event(&rx, Duration::from_secs(5)),
+            DshEvent::Exited { exit_code: Some(0), requested: false }
+        );
+    }
+
+    #[test]
+    fn abnormal_exit_reports_none_code() {
+        let (_process, rx) = spawn_fake("exit 7");
+        assert_eq!(
+            next_event(&rx, Duration::from_secs(5)),
+            DshEvent::Exited { exit_code: Some(7), requested: false }
+        );
+    }
+
+    #[test]
+    fn stop_terminates_process_and_reports_requested_exit() {
+        let (process, rx) = spawn_fake("sleep 30");
+        process.stop();
+        match next_event(&rx, Duration::from_secs(5)) {
+            DshEvent::Exited { requested: true, .. } => {}
+            other => panic!("expected requested exit, got {other:?}"),
+        }
+        assert!(!process.is_running());
+        // 幂等：重复 stop 不 panic。
+        process.stop();
+    }
+
+    #[test]
+    fn stop_escalates_to_sigkill_when_term_is_ignored() {
+        // trap 忽略 SIGTERM 的 shell 会在 sleep（无 trap）死后退出；
+        // 无论哪条路径退出，都必须落在 requested 退出上。
+        let (process, rx) = spawn_fake("trap '' TERM; sleep 30");
+        process.stop();
+        match next_event(&rx, Duration::from_secs(5)) {
+            DshEvent::Exited { requested: true, .. } => {}
+            other => panic!("expected requested exit after escalation, got {other:?}"),
+        }
+        assert!(!process.is_running());
+    }
+
+    #[test]
+    fn spawn_failure_returns_error() {
+        let config = DshConfig {
+            program: PathBuf::from("/nonexistent/dsh-binary-for-test"),
+            args: vec![],
+            child_path: None,
+            boot_timeout: Duration::from_millis(100),
+            kill_grace: Duration::from_millis(100),
+        };
+        let result = DshProcess::spawn(config, Arc::new(|_event| {}));
+        assert!(result.is_err(), "expected spawn error for missing binary");
     }
 }
