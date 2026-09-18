@@ -398,6 +398,69 @@ mod zoom_tests {
     }
 }
 
+/// 停止 dsh 并等待其退出（最多 3 秒），然后真正退出应用。
+/// 在专用线程执行等待，避免阻塞主线程；托盘退出与系统退出请求共用。
+fn request_quit(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let process = app.state::<AppState>().process.lock().unwrap().take();
+        if let Some(process) = process {
+            process.stop();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while process.is_running() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        app.exit(0);
+    });
+}
+
+/// 构建系统托盘：显示/退出菜单 + 左键点击唤起窗口（移植自 deepseek_app）。
+#[cfg(target_os = "macos")]
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let show = MenuItemBuilder::with_id("show", "显示 dsh-ui").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "退出").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+
+    let img = image::load_from_memory(include_bytes!("../icons/icon.png"))
+        .expect("failed to load tray icon")
+        .to_rgba8();
+    let (width, height) = img.dimensions();
+    let icon = tauri::image::Image::new_owned(img.into_raw(), width, height);
+
+    TrayIconBuilder::new()
+        .icon(icon)
+        .menu(&menu)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            "quit" => request_quit(app.clone()),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -438,7 +501,10 @@ pub fn run() {
         .setup(|app| {
             build_main_window(app)?;
             #[cfg(target_os = "macos")]
-            build_menu(app)?;
+            {
+                build_menu(app)?;
+                build_tray(app)?;
+            }
             // 页面 emit 的主题事件（fallback 通道）：主线程应用原生外观。
             let handle = app.handle().clone();
             app.listen("theme-changed", move |event| {
@@ -476,26 +542,10 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
-                // code None = 关闭/托盘触发的退出请求；拦下先清理 dsh 再真退出。
+                // code None = 关闭/系统触发的退出请求；拦下先清理 dsh 再真退出。
                 if code.is_none() {
                     api.prevent_exit();
-                    let app = app.clone();
-                    std::thread::spawn(move || {
-                        let process = app
-                            .state::<AppState>()
-                            .process
-                            .lock()
-                            .unwrap()
-                            .take();
-                        if let Some(process) = process {
-                            process.stop();
-                            let deadline = std::time::Instant::now() + Duration::from_secs(3);
-                            while process.is_running() && std::time::Instant::now() < deadline {
-                                std::thread::sleep(Duration::from_millis(50));
-                            }
-                        }
-                        app.exit(0);
-                    });
+                    request_quit(app.clone());
                 }
             }
         });
