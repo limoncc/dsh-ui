@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>dsh-ui 状态条</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 12px;
+        box-sizing: border-box;
+        background: #f5f5f7;
+        color: #3a3a3c;
+        font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
+        font-size: 12px;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      @media (prefers-color-scheme: dark) {
+        body {
+          background: #28282a;
+          color: #d1d1d6;
+        }
+        button {
+          background: rgba(255, 255, 255, 0.08) !important;
+          border-color: rgba(255, 255, 255, 0.18) !important;
+          color: #d1d1d6 !important;
+        }
+      }
+      .status {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #f39c12;
+      }
+      .dot.ready {
+        background: #27ae60;
+      }
+      .dot.stopped,
+      .dot.error {
+        background: #c0392b;
+      }
+      button {
+        font-size: 12px;
+        padding: 3px 10px;
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        border-radius: 6px;
+        background: rgba(255, 255, 255, 0.6);
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="text">启动中…</span>
+    </div>
+    <button id="terminal" title="在窗口下方打开系统终端">终端</button>
+    <script>
+      const T = window.__TAURI__;
+      const LABELS = {
+        starting: '启动中…',
+        ready: '已连接',
+        stopped: 'dsh 已停止',
+        error: '启动失败',
+      };
+      function apply(state) {
+        document.getElementById('dot').className = 'dot ' + state.status;
+        document.getElementById('text').textContent = LABELS[state.status] || state.status;
+      }
+      if (T) {
+        T.event.listen('dsh://state', (event) => apply(event.payload));
+        T.core.invoke('get_dsh_state').then(apply).catch(() => {});
+        document.getElementById('terminal').addEventListener('click', () => {
+          T.core.invoke('open_terminal').catch(() => {});
+        });
+      }
+    </script>
+  </body>
+</html>

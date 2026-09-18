@@ -64,6 +64,62 @@ pub fn node_version_ok(major: u32) -> bool {
     major >= MIN_NODE_MAJOR
 }
 
+/// 环境探测产物：dsh 与 node 的绝对路径及 node 版本。
+#[derive(Debug, Clone)]
+pub struct Environment {
+    pub dsh_path: PathBuf,
+    pub node_path: PathBuf,
+    pub node_major: u32,
+}
+
+/// 环境探测结论；错误分支即错误页的指引依据。
+#[derive(Debug)]
+pub enum EnvCheck {
+    Ok(Environment),
+    /// 未找到 dsh 可执行文件。
+    MissingDsh,
+    /// 未找到 node，或其版本输出无法解析。
+    MissingNode,
+    /// node 版本低于 dsh 要求。
+    NodeTooOld { major: u32 },
+}
+
+/// 捕获一个可执行文件带参数运行后的 stdout（启动失败或非零退出返回 None）。
+fn run_and_capture_output(program: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// 按 PATH 与 GUI 常见目录探测 dsh 与 node，并校验 node 版本。
+pub fn detect_environment(path_env: Option<&str>) -> EnvCheck {
+    let fallbacks: Vec<PathBuf> = EXTRA_BIN_DIRS.iter().map(PathBuf::from).collect();
+    detect_environment_with_dirs(path_env, &fallbacks)
+}
+
+/// [`detect_environment`] 的可注入版本：`extra_dirs` 替代 GUI 常见目录，供测试使用。
+pub fn detect_environment_with_dirs(path_env: Option<&str>, extra_dirs: &[PathBuf]) -> EnvCheck {
+    let mut dirs = path_env.map(dirs_from_path).unwrap_or_default();
+    dirs.extend_from_slice(extra_dirs);
+    let Some(dsh_path) = find_executable("dsh", &dirs) else {
+        return EnvCheck::MissingDsh;
+    };
+    let node_probe = find_executable("node", &dirs)
+        .and_then(|node| run_and_capture_output(&node, &["--version"]).map(|out| (node, out)));
+    let Some((node_path, version_output)) = node_probe else {
+        return EnvCheck::MissingNode;
+    };
+    match parse_node_version(&version_output) {
+        Some(major) if node_version_ok(major) => {
+            EnvCheck::Ok(Environment { dsh_path, node_path, node_major: major })
+        }
+        Some(major) => EnvCheck::NodeTooOld { major },
+        None => EnvCheck::MissingNode,
+    }
+}
+
 /// 子进程 PATH：探测命中目录放最前，保证 `dsh` shebang 的 `env node` 能找到同一 node。
 pub fn child_path(dirs: &[PathBuf], inherited: Option<&str>) -> String {
     let mut parts: Vec<String> = dirs.iter().map(|dir| dir.display().to_string()).collect();
@@ -492,6 +548,79 @@ mod tests {
             parse_ready_line("dsh web: http://127.0.0.1:1/?token=t\r\n"),
             Some("http://127.0.0.1:1/?token=t".to_string())
         );
+    }
+
+    /// 写一个打印指定内容的"假 node"脚本（`--version` 时输出给定的版本行）。
+    fn fake_node(dir: &TempDir, version_line: &str) -> PathBuf {
+        let file = dir.path().join("node");
+        fs::write(&file, format!("#!/bin/sh\necho '{version_line}'\n")).expect("write fake node");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).expect("chmod");
+        file
+    }
+
+    #[test]
+    fn detect_environment_ok_when_dsh_and_fresh_node_present() {
+        let dir = TempDir::new("env-ok");
+        dir.executable("dsh");
+        fake_node(&dir, "v22.11.0");
+        let extra = vec![dir.path()];
+        match detect_environment_with_dirs(Some(""),&extra) {
+            EnvCheck::Ok(env) => {
+                assert_eq!(env.dsh_path, dir.path().join("dsh"));
+                assert_eq!(env.node_path, dir.path().join("node"));
+                assert_eq!(env.node_major, 22);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_environment_missing_dsh_when_nothing_found() {
+        let dir = TempDir::new("env-empty");
+        assert!(matches!(
+            detect_environment_with_dirs(Some(""),&[dir.path()]),
+            EnvCheck::MissingDsh
+        ));
+    }
+
+    #[test]
+    fn detect_environment_missing_node_when_only_dsh_found() {
+        let dir = TempDir::new("env-nonode");
+        dir.executable("dsh");
+        assert!(matches!(
+            detect_environment_with_dirs(Some(""),&[dir.path()]),
+            EnvCheck::MissingNode
+        ));
+    }
+
+    #[test]
+    fn detect_environment_node_too_old() {
+        let dir = TempDir::new("env-old");
+        dir.executable("dsh");
+        fake_node(&dir, "v18.20.0");
+        assert!(matches!(
+            detect_environment_with_dirs(Some(""),&[dir.path()]),
+            EnvCheck::NodeTooOld { major: 18 }
+        ));
+    }
+
+    #[test]
+    fn detect_environment_unparsable_node_version_treated_as_missing() {
+        let dir = TempDir::new("env-garbage");
+        dir.executable("dsh");
+        fake_node(&dir, "garbage output");
+        assert!(matches!(
+            detect_environment_with_dirs(Some(""),&[dir.path()]),
+            EnvCheck::MissingNode
+        ));
+    }
+
+    #[test]
+    fn detect_environment_real_machine_has_compatible_node_if_present() {
+        // 宽松冒烟：本机若能找到 node，其版本必须满足 dsh 要求。
+        if find_executable("node", &search_dirs(None)).is_some() {
+            assert!(matches!(detect_environment(None), EnvCheck::Ok(_)));
+        }
     }
 }
 
