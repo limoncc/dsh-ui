@@ -24,6 +24,8 @@ struct DshState {
 struct AppState {
     process: Mutex<Option<dsh::DshProcess>>,
     state: Mutex<DshState>,
+    /// dsh 就绪后记录的实际端口，用于导航放行判定。
+    dsh_port: Mutex<Option<u16>>,
 }
 
 #[tauri::command]
@@ -56,6 +58,8 @@ fn boot_timeout_from_env() -> Duration {
 fn handle_dsh_event(app: &tauri::AppHandle, event: dsh::DshEvent) {
     match event {
         dsh::DshEvent::Ready { url } => {
+            let port = url.parse::<tauri::Url>().ok().and_then(|parsed| parsed.port());
+            *app.state::<AppState>().dsh_port.lock().unwrap() = port;
             set_status(app, "ready", Some(url.clone()), None);
             if let Some(content) = app.get_webview("content") {
                 if let Ok(parsed) = url.parse::<tauri::Url>() {
@@ -140,8 +144,20 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
     let content_height = (inner.height as f64 - bar_height).max(0.0);
     let width = inner.width as f64;
 
-    let content =
-        WebviewBuilder::new("content", WebviewUrl::App("loading.html".into())).auto_resize();
+    // content：导航锁定——只放行壳页面与当前 dsh 端口，其余转系统浏览器。
+    let app_handle = app.handle().clone();
+    let content = WebviewBuilder::new("content", WebviewUrl::App("loading.html".into()))
+        .auto_resize()
+        .on_navigation(move |url| {
+            let allowed = dsh::is_allowed_navigation(
+                url.as_str(),
+                *app_handle.state::<AppState>().dsh_port.lock().unwrap(),
+            );
+            if !allowed {
+                let _ = std::process::Command::new("open").arg(url.as_str()).spawn();
+            }
+            allowed
+        });
     window.add_child(
         content,
         PhysicalPosition::new(0.0, 0.0),
@@ -168,7 +184,11 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .manage(AppState { process: Mutex::new(None), state: Mutex::new(DshState::default()) })
+        .manage(AppState {
+            process: Mutex::new(None),
+            state: Mutex::new(DshState::default()),
+            dsh_port: Mutex::new(None),
+        })
         .invoke_handler(tauri::generate_handler![get_dsh_state])
         .setup(|app| {
             build_main_window(app)?;

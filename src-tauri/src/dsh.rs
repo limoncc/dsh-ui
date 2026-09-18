@@ -93,6 +93,27 @@ fn run_and_capture_output(program: &Path, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+/// webview 导航放行判定。
+///
+/// 仅放行两类地址：本地壳页面（loading/bar 等 `tauri://localhost` 页面），
+/// 以及当前 dsh 实例的 loopback HTTP 页面（`port` 为就绪后记录的端口；
+/// 尚未就绪时为 None，此时一切远程导航都拒绝）。其余地址由调用方
+/// 转交系统浏览器打开。
+pub fn is_allowed_navigation(url: &str, port: Option<u16>) -> bool {
+    const SHELL_PREFIXES: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
+    if SHELL_PREFIXES.iter().any(|prefix| url.starts_with(prefix)) {
+        return true;
+    }
+    let Some(port) = port else {
+        return false;
+    };
+    let Some(rest) = url.strip_prefix("http://127.0.0.1:") else {
+        return false;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    rest[..authority_end].parse::<u16>() == Ok(port)
+}
+
 /// 按 PATH 与 GUI 常见目录探测 dsh 与 node，并校验 node 版本。
 pub fn detect_environment(path_env: Option<&str>) -> EnvCheck {
     let fallbacks: Vec<PathBuf> = EXTRA_BIN_DIRS.iter().map(PathBuf::from).collect();
@@ -621,6 +642,29 @@ mod tests {
         if find_executable("node", &search_dirs(None)).is_some() {
             assert!(matches!(detect_environment(None), EnvCheck::Ok(_)));
         }
+    }
+
+    #[test]
+    fn navigation_allows_shell_pages_regardless_of_port() {
+        assert!(is_allowed_navigation("tauri://localhost/loading.html", None));
+        assert!(is_allowed_navigation("tauri://localhost/bar.html", Some(3080)));
+        assert!(is_allowed_navigation("http://tauri.localhost/bar.html", None));
+    }
+
+    #[test]
+    fn navigation_allows_only_current_dsh_port_on_loopback() {
+        assert!(is_allowed_navigation("http://127.0.0.1:64898/?token=t", Some(64898)));
+        assert!(is_allowed_navigation("http://127.0.0.1:64898/sessions/abc", Some(64898)));
+        assert!(!is_allowed_navigation("http://127.0.0.1:64899/?token=t", Some(64898)));
+        assert!(!is_allowed_navigation("http://127.0.0.1:64898/", None));
+    }
+
+    #[test]
+    fn navigation_rejects_foreign_hosts_and_schemes() {
+        assert!(!is_allowed_navigation("https://example.com/path", Some(64898)));
+        assert!(!is_allowed_navigation("http://localhost:64898/", Some(64898)));
+        assert!(!is_allowed_navigation("file:///etc/passwd", Some(64898)));
+        assert!(!is_allowed_navigation("http://127.0.0.1:port/", Some(64898)));
     }
 }
 
