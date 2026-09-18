@@ -1,6 +1,7 @@
 pub mod dsh;
 
 use serde::Serialize;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::webview::WebviewBuilder;
@@ -69,6 +70,87 @@ struct AppState {
     state: Mutex<DshState>,
     /// dsh 就绪后记录的实际端口，用于导航放行判定。
     dsh_port: Mutex<Option<u16>>,
+    /// content webview 当前缩放（百分比）。
+    zoom: AtomicU32,
+}
+
+/// 对 content webview 应用缩放。
+fn apply_zoom(app: &tauri::AppHandle, percent: u32) {
+    if let Some(content) = app.get_webview("content") {
+        let _ = content.set_zoom(f64::from(percent) / 100.0);
+    }
+}
+
+/// 构建 macOS 原生菜单（App/Edit/View/Window，移植自 deepseek_app）。
+#[cfg(target_os = "macos")]
+fn build_menu(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    let zoom_in = MenuItem::with_id(app, "zoom_in", "放大", true, Some("CmdOrCtrl+="))?;
+    let zoom_out = MenuItem::with_id(app, "zoom_out", "缩小", true, Some("CmdOrCtrl+-"))?;
+    let zoom_reset =
+        MenuItem::with_id(app, "zoom_reset", "实际大小", true, Some("CmdOrCtrl+0"))?;
+
+    let edit_menu = Submenu::with_items(
+        app,
+        "编辑",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app, None::<&str>)?,
+            &PredefinedMenuItem::redo(app, None::<&str>)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::cut(app, None::<&str>)?,
+            &PredefinedMenuItem::copy(app, None::<&str>)?,
+            &PredefinedMenuItem::paste(app, None::<&str>)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::select_all(app, None::<&str>)?,
+        ],
+    )?;
+
+    let view_menu = Submenu::with_items(
+        app,
+        "显示",
+        true,
+        &[
+            &zoom_in,
+            &zoom_out,
+            &PredefinedMenuItem::separator(app)?,
+            &zoom_reset,
+        ],
+    )?;
+
+    let app_menu = Submenu::with_items(
+        app,
+        "dsh-ui",
+        true,
+        &[
+            &PredefinedMenuItem::about(app, Some("关于 dsh-ui"), None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::services(app, None::<&str>)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::hide(app, None::<&str>)?,
+            &PredefinedMenuItem::hide_others(app, None::<&str>)?,
+            &PredefinedMenuItem::show_all(app, None::<&str>)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::quit(app, None::<&str>)?,
+        ],
+    )?;
+
+    let window_menu = Submenu::with_items(
+        app,
+        "窗口",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, None::<&str>)?,
+            &PredefinedMenuItem::fullscreen(app, None::<&str>)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::close_window(app, None::<&str>)?,
+            &PredefinedMenuItem::bring_all_to_front(app, None::<&str>)?,
+        ],
+    )?;
+
+    app.set_menu(Menu::with_items(app, &[&app_menu, &edit_menu, &view_menu, &window_menu])?)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -262,6 +344,60 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/// 缩放档位（百分比），Safari 风格；Cmd+=/-/0 与预设菜单共用。
+pub const ZOOM_STEPS: &[u32] =
+    &[25, 33, 50, 67, 75, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500];
+
+/// 放大：返回第一个大于 current 的档位；已达上限时保持 500。
+pub fn next_zoom(current: u32) -> u32 {
+    ZOOM_STEPS
+        .iter()
+        .copied()
+        .find(|step| *step > current)
+        .unwrap_or(*ZOOM_STEPS.last().expect("non-empty"))
+}
+
+/// 缩小：返回最后一个小于 current 的档位；已达下限时保持 25。
+pub fn prev_zoom(current: u32) -> u32 {
+    ZOOM_STEPS
+        .iter()
+        .copied()
+        .rev()
+        .find(|step| *step < current)
+        .unwrap_or(*ZOOM_STEPS.first().expect("non-empty"))
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::{next_zoom, prev_zoom, ZOOM_STEPS};
+
+    #[test]
+    fn zoom_steps_are_ascending_and_bounded() {
+        let mut sorted = ZOOM_STEPS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, ZOOM_STEPS.to_vec(), "档位必须严格升序且无重复");
+        assert_eq!(ZOOM_STEPS.first(), Some(&25));
+        assert_eq!(ZOOM_STEPS.last(), Some(&500));
+    }
+
+    #[test]
+    fn zoom_in_moves_to_next_step_and_clamps_at_max() {
+        assert_eq!(next_zoom(100), 110);
+        assert_eq!(next_zoom(90), 100);
+        assert_eq!(next_zoom(0), 25);
+        assert_eq!(next_zoom(500), 500);
+        assert_eq!(next_zoom(490), 500);
+    }
+
+    #[test]
+    fn zoom_out_moves_to_prev_step_and_clamps_at_min() {
+        assert_eq!(prev_zoom(100), 90);
+        assert_eq!(prev_zoom(110), 100);
+        assert_eq!(prev_zoom(25), 25);
+        assert_eq!(prev_zoom(26), 25);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -277,10 +413,32 @@ pub fn run() {
             process: Mutex::new(None),
             state: Mutex::new(DshState::default()),
             dsh_port: Mutex::new(None),
+            zoom: AtomicU32::new(100),
+        })
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "zoom_in" => {
+                let state = app.state::<AppState>();
+                let next = next_zoom(state.zoom.load(Ordering::Relaxed));
+                state.zoom.store(next, Ordering::Relaxed);
+                apply_zoom(app, next);
+            }
+            "zoom_out" => {
+                let state = app.state::<AppState>();
+                let prev = prev_zoom(state.zoom.load(Ordering::Relaxed));
+                state.zoom.store(prev, Ordering::Relaxed);
+                apply_zoom(app, prev);
+            }
+            "zoom_reset" => {
+                app.state::<AppState>().zoom.store(100, Ordering::Relaxed);
+                apply_zoom(app, 100);
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![get_dsh_state, report_theme])
         .setup(|app| {
             build_main_window(app)?;
+            #[cfg(target_os = "macos")]
+            build_menu(app)?;
             // 页面 emit 的主题事件（fallback 通道）：主线程应用原生外观。
             let handle = app.handle().clone();
             app.listen("theme-changed", move |event| {
