@@ -732,6 +732,7 @@ mod process_tests {
     use std::path::PathBuf;
     use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
     use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::Duration;
 
     const READY_URL: &str = "http://127.0.0.1:45678/?token=testtoken";
@@ -769,7 +770,16 @@ mod process_tests {
             next_event(&rx, Duration::from_secs(5)),
             DshEvent::Ready { url: "http://127.0.0.1:45678/?token=t".to_string() }
         );
-        let tail = String::from_utf8(process.stderr_tail()).expect("stderr tail utf8");
+        // stderr 线程与 stdout 线程独立，就绪行出现不代表 stderr 已收集完毕：轮询等待。
+        let mut tail = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            tail = String::from_utf8(process.stderr_tail()).expect("stderr tail utf8");
+            if tail.contains("boom") && tail.contains("warning line") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         assert!(tail.contains("boom"), "tail 应包含 stderr 内容，实际：{tail:?}");
         assert!(tail.contains("warning line"));
         // 不包含 stdout 内容（就绪行走 stdout 不进 stderr tail）。

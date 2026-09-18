@@ -175,6 +175,49 @@ fn open_log_dir() {
     }
 }
 
+/// Tauri 命令：在主窗口正下方打开 Terminal.app 新窗口。
+#[tauri::command]
+fn open_terminal(app: tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+        return;
+    };
+    let window_rect = Rect {
+        x: f64::from(position.x),
+        y: f64::from(position.y),
+        w: f64::from(size.width),
+        h: f64::from(size.height),
+    };
+    let screen_rect = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| Rect {
+            x: f64::from(monitor.position().x),
+            y: f64::from(monitor.position().y),
+            w: f64::from(monitor.size().width),
+            h: f64::from(monitor.size().height),
+        })
+        .unwrap_or(window_rect);
+    let bounds = terminal_bounds(window_rect, screen_rect, 8.0, 480.0, 120.0);
+
+    // AppleScript bounds 为 {left, top, right, bottom}（顶部原点，与 Tauri 一致）。
+    let script = format!(
+        "tell application \"Terminal\"\n\
+         \x20 activate\n\
+         \x20 do script \"\"\n\
+         \x20 set bounds of front window to {{{x}, {y}, {right}, {bottom}}}\n\
+         end tell",
+        x = bounds.x as i32,
+        y = bounds.y as i32,
+        right = (bounds.x + bounds.w) as i32,
+        bottom = (bounds.y + bounds.h) as i32,
+    );
+    let _ = std::process::Command::new("/usr/bin/osascript").arg("-e").arg(&script).spawn();
+}
+
 /// Tauri 命令：dsh 页面的主题检测脚本经此回报主题变化。
 #[tauri::command]
 fn report_theme(app: tauri::AppHandle, theme: String) {
@@ -446,6 +489,77 @@ mod zoom_tests {
     }
 }
 
+/// 屏幕上的矩形（物理像素，左上原点）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// 计算终端窗口的目标位置：与主窗口同宽、正下方留 `gap` 间距，
+/// 高度取 `max_height` 与屏幕底部余量的较小者（至少 `min_height`），
+/// 整体不越出屏幕。
+pub fn terminal_bounds(
+    window: Rect,
+    screen: Rect,
+    gap: f64,
+    max_height: f64,
+    min_height: f64,
+) -> Rect {
+    let desired_y = window.y + window.h + gap;
+    let screen_bottom = screen.y + screen.h;
+    let height = max_height.min((screen_bottom - desired_y).max(min_height));
+    let y = desired_y.min(screen_bottom - height);
+    let width = window.w.min(screen.w);
+    let x = window.x.clamp(screen.x, screen.x + screen.w - width);
+    Rect { x, y, w: width, h: height }
+}
+
+#[cfg(test)]
+mod terminal_bounds_tests {
+    use super::{terminal_bounds, Rect};
+
+    const SCREEN: Rect = Rect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 };
+
+    #[test]
+    fn terminal_sits_below_window_with_max_height_when_space_allows() {
+        let window = Rect { x: 100.0, y: 50.0, w: 1200.0, h: 300.0 };
+        let bounds = terminal_bounds(window, SCREEN, 8.0, 480.0, 120.0);
+        assert_eq!(
+            bounds,
+            Rect { x: 100.0, y: 358.0, w: 1200.0, h: 480.0 },
+            "应正对窗口下方、留 8px 间距；余量 542 > 480，高度取上限"
+        );
+    }
+
+    #[test]
+    fn terminal_shrinks_when_screen_space_is_tight() {
+        let window = Rect { x: 0.0, y: 500.0, w: 1200.0, h: 300.0 };
+        let bounds = terminal_bounds(window, SCREEN, 8.0, 480.0, 120.0);
+        // 余量 900-808=92 低于最小高度 120：高度取 120，并收进屏幕底边。
+        assert_eq!(bounds.h, 120.0);
+        assert_eq!(bounds.y, 780.0);
+    }
+
+    #[test]
+    fn terminal_keeps_min_height_when_window_touches_screen_bottom() {
+        let window = Rect { x: 0.0, y: 0.0, w: 1200.0, h: 900.0 };
+        let bounds = terminal_bounds(window, SCREEN, 8.0, 480.0, 120.0);
+        assert_eq!(bounds.h, 120.0, "无空间时保持最小高度");
+        assert_eq!(bounds.y, 780.0, "y 收进屏幕底边");
+    }
+
+    #[test]
+    fn terminal_clamps_into_screen_horizontally() {
+        let window = Rect { x: 1400.0, y: 50.0, w: 1200.0, h: 400.0 };
+        let bounds = terminal_bounds(window, SCREEN, 8.0, 480.0, 120.0);
+        assert_eq!(bounds.w, 1200.0);
+        assert_eq!(bounds.x, 240.0, "越出右边缘时收进屏幕");
+    }
+}
+
 /// 停止 dsh 并等待其退出（最多 3 秒），然后真正退出应用。
 /// 在专用线程执行等待，避免阻塞主线程；托盘退出与系统退出请求共用。
 fn request_quit(app: tauri::AppHandle) {
@@ -549,7 +663,8 @@ pub fn run() {
             get_dsh_state,
             report_theme,
             restart_dsh,
-            open_log_dir
+            open_log_dir,
+            open_terminal
         ])
         .setup(|app| {
             build_main_window(app)?;
