@@ -18,7 +18,13 @@ const THEME_DETECT_SCRIPT: &str = r#"
 (function(){
     function getTheme(){
         var el;
+        // dsh 把主题标在 <html style="color-scheme: dark"> 内联样式上
         el=document.documentElement;
+        if(el&&el.style){
+            var cs=(el.style.getPropertyValue('color-scheme')||'').trim();
+            if(cs==='dark')return'dark';
+            if(cs==='light')return'light';
+        }
         if(el){
             if(el.classList.contains('dark'))return'dark';
             var a=el.getAttribute('data-theme');
@@ -31,6 +37,11 @@ const THEME_DETECT_SCRIPT: &str = r#"
         }
         el=document.body;
         if(el){
+            if(el.style){
+                var bs=(el.style.getPropertyValue('color-scheme')||'').trim();
+                if(bs==='dark')return'dark';
+                if(bs==='light')return'light';
+            }
             for(var i=0;i<el.classList.length;i++){
                 var c=el.classList[i];
                 if(c==='dark')return'dark';
@@ -41,7 +52,6 @@ const THEME_DETECT_SCRIPT: &str = r#"
     }
     function report(t){
         try{window.__TAURI_INTERNALS__.invoke('report_theme',{theme:t}).catch(function(){})}catch(e){}
-        try{window.__TAURI_INTERNALS__.emit('theme-changed',{theme:t})}catch(e){}
     }
     function setup(){
         report(getTheme());
@@ -52,7 +62,6 @@ const THEME_DETECT_SCRIPT: &str = r#"
     }
     if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',setup);
     else setup();
-    var n=0,i=setInterval(function(){report(getTheme());if(++n>=20)clearInterval(i)},500);
 })();
 "#;
 
