@@ -7,6 +7,9 @@
       body {
         --bg: #f5f5f7;
         --fg: #1d1d1f;
+        --sub: #6e6e73;
+        --line: rgba(0, 0, 0, 0.12);
+        --btn-bg: rgba(0, 0, 0, 0.05);
         font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
         display: flex;
         align-items: center;
@@ -19,10 +22,17 @@
       body.dark {
         --bg: #1e1e20;
         --fg: #f5f5f7;
+        --sub: #a1a1a6;
+        --line: rgba(255, 255, 255, 0.16);
+        --btn-bg: rgba(255, 255, 255, 0.08);
       }
       .box {
+        max-width: min(560px, 80vw);
+        max-height: 88vh;
+        overflow: auto;
+      }
+      .center {
         text-align: center;
-        max-width: 72vw;
       }
       .title {
         font-size: 17px;
@@ -30,48 +40,244 @@
       }
       .hint {
         font-size: 13px;
-        opacity: 0.6;
+        color: var(--sub);
         margin-top: 8px;
       }
-      .error {
+      .error-box {
         font-size: 13px;
+        line-height: 1.7;
+      }
+      .error-title {
+        font-size: 15px;
+        font-weight: 600;
         color: #c0392b;
-        margin-top: 16px;
+        margin-bottom: 6px;
+      }
+      .error-box a {
+        color: #0a84ff;
+        text-decoration: none;
+      }
+      .steps {
+        margin: 10px 0;
+        padding-left: 20px;
+      }
+      .steps li {
+        margin: 8px 0;
+      }
+      .cmd-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 4px;
+      }
+      .cmd {
+        font-family: ui-monospace, Menlo, monospace;
+        font-size: 12px;
+        background: var(--btn-bg);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 5px 10px;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      .copy {
+        font-size: 11px;
+        padding: 3px 8px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--btn-bg);
+        color: var(--fg);
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .raw-error {
+        font-family: ui-monospace, Menlo, monospace;
+        font-size: 11px;
+        color: var(--sub);
         white-space: pre-wrap;
-        line-height: 1.6;
+        margin-top: 10px;
+        max-height: 160px;
+        overflow: auto;
+      }
+      .ops {
+        margin-top: 16px;
+        display: flex;
+        gap: 10px;
+      }
+      .ops button {
+        font-size: 12px;
+        padding: 6px 14px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--btn-bg);
+        color: var(--fg);
+        cursor: pointer;
+      }
+      .ops button.primary {
+        background: #0a84ff;
+        border-color: #0a84ff;
+        color: #fff;
       }
     </style>
   </head>
   <body>
-    <div class="box">
+    <!-- 启动中 -->
+    <div class="box center" id="booting">
       <div class="title">正在启动 DeepSeek Harness…</div>
       <div class="hint" id="hint">首次启动可能需要较长时间</div>
-      <div class="error" id="error"></div>
     </div>
+
+    <!-- 错误态：分步指引 -->
+    <div class="box error-box" id="error-box" hidden>
+      <div class="error-title" id="error-title"></div>
+      <ol id="steps"></ol>
+      <div class="hint" id="error-hint"></div>
+      <div class="raw-error" id="raw-error"></div>
+      <div class="ops">
+        <button id="retry" class="primary">重新检测</button>
+        <button id="open-settings">打开设置手动指定路径</button>
+      </div>
+    </div>
+
     <script>
       const T = window.__TAURI__;
+
+      // 按错误类型渲染的安装指引；steps 中 cmd 会被渲染成可复制的命令块。
+      const GUIDES = {
+        missing_dsh: {
+          title: '未找到 dsh 命令',
+          steps: [
+            {
+              label: '安装 Node.js（需要 ≥22）',
+              cmd: 'brew install node',
+              link: { href: 'https://nodejs.org', text: '或从 nodejs.org 下载' },
+            },
+            {
+              label: '安装 DeepSeek Harness CLI',
+              cmd: 'npm i -g @deepseek-ai/dsh',
+            },
+          ],
+          hint: '装好后点击「重新检测」；若安装在非常规位置，请打开设置手动指定路径。',
+        },
+        missing_node: {
+          title: '未找到 Node.js',
+          steps: [
+            {
+              label: '安装 Node.js（需要 ≥22）',
+              cmd: 'brew install node',
+              link: { href: 'https://nodejs.org', text: '或从 nodejs.org 下载' },
+            },
+          ],
+          hint: '装好后点击「重新检测」；若安装在非常规位置，请打开设置手动指定路径。',
+        },
+        node_too_old: {
+          title: 'Node.js 版本过低',
+          steps: [
+            {
+              label: '升级 Node.js（dsh 需要 ≥22）',
+              cmd: 'brew upgrade node',
+              link: { href: 'https://nodejs.org', text: '或从 nodejs.org 下载' },
+            },
+          ],
+          hint: '升级后点击「重新检测」；若使用了多版本管理（如 nvm/fnm），请在设置里手动指定 node 路径。',
+        },
+        boot_timeout: {
+          title: 'dsh 启动超时',
+          steps: [],
+          hint: '请查看下方最近日志；也可点击「打开日志」查看完整输出。',
+        },
+        crashed: {
+          title: 'dsh 进程已退出',
+          steps: [],
+          hint: '请查看下方最近日志；也可点击「打开日志」查看完整输出。',
+        },
+        spawn_failed: {
+          title: '无法启动 dsh',
+          steps: [],
+          hint: '请检查下方错误信息；若路径已失效，请打开设置重新指定。',
+        },
+      };
+
       function setTheme(theme) {
         document.body.classList.toggle('dark', theme === 'dark');
       }
       setTheme(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+
+      const bootingEl = document.getElementById('booting');
+      const errorBoxEl = document.getElementById('error-box');
+
+      function showBooting() {
+        bootingEl.hidden = false;
+        errorBoxEl.hidden = true;
+      }
+
+      function renderError(kind, message) {
+        const guide = GUIDES[kind] || { title: message || '启动失败', steps: [], hint: '' };
+        bootingEl.hidden = true;
+        errorBoxEl.hidden = false;
+        document.getElementById('error-title').textContent = guide.title;
+        document.getElementById('error-hint').textContent = guide.hint || '';
+        document.getElementById('raw-error').textContent =
+          guide.steps.length === 0 && message ? message : '';
+
+        const stepsEl = document.getElementById('steps');
+        stepsEl.innerHTML = '';
+        guide.steps.forEach((step) => {
+          const li = document.createElement('li');
+          li.textContent = step.label;
+          const row = document.createElement('div');
+          row.className = 'cmd-row';
+          const cmd = document.createElement('span');
+          cmd.className = 'cmd';
+          cmd.textContent = step.cmd;
+          const copy = document.createElement('button');
+          copy.className = 'copy';
+          copy.textContent = '复制';
+          copy.addEventListener('click', () => {
+            navigator.clipboard.writeText(step.cmd).then(() => {
+              copy.textContent = '已复制';
+              setTimeout(() => (copy.textContent = '复制'), 1500);
+            });
+          });
+          row.appendChild(cmd);
+          row.appendChild(copy);
+          if (step.link) {
+            const a = document.createElement('a');
+            a.href = step.link.href;
+            a.textContent = step.link.text;
+            a.target = '_blank';
+            row.appendChild(a);
+          }
+          li.appendChild(row);
+          stepsEl.appendChild(li);
+        });
+      }
+
       if (T) {
         T.event.listen('dsh://state', (event) => {
           const state = event.payload;
-          const errorEl = document.getElementById('error');
-          const hintEl = document.getElementById('hint');
           if (state.status === 'ready') {
-            errorEl.textContent = '';
+            showBooting();
           } else if (state.status === 'error' || state.status === 'stopped') {
-            errorEl.textContent = state.error || 'dsh 已停止。';
-            hintEl.textContent = '修复问题后，从底部状态条重启，或退出应用重新打开。';
+            renderError(state.error_kind, state.error);
           }
         });
         T.event.listen('dsh://theme', (event) => setTheme(event.payload.theme));
-        T.core.invoke('get_dsh_state').then((state) => {
-          if (state.status === 'error' || state.status === 'stopped') {
-            document.getElementById('error').textContent = state.error || '';
-          }
-        }).catch(() => {});
+        T.core
+          .invoke('get_dsh_state')
+          .then((state) => {
+            if (state.status === 'error' || state.status === 'stopped') {
+              renderError(state.error_kind, state.error);
+            }
+          })
+          .catch(() => {});
+        document.getElementById('retry').addEventListener('click', () => {
+          showBooting();
+          T.core.invoke('restart_dsh').catch(() => {});
+        });
+        document.getElementById('open-settings').addEventListener('click', () => {
+          T.core.invoke('open_settings').catch(() => {});
+        });
       }
     </script>
   </body>

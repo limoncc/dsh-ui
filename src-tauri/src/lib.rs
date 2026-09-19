@@ -65,6 +65,32 @@ struct DshState {
     status: String, // "starting" | "ready" | "stopped" | "error"
     url: Option<String>,
     error: Option<String>,
+    /// 错误分类，驱动前端渲染对应的安装指引；
+    /// missing_dsh | missing_node | node_too_old | boot_timeout | crashed | spawn_failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_kind: Option<String>,
+}
+
+#[cfg(test)]
+mod dsh_state_tests {
+    use super::DshState;
+
+    #[test]
+    fn dsh_state_serializes_error_kind_for_frontend() {
+        let state = DshState {
+            status: "error".to_string(),
+            url: None,
+            error: Some("未找到 dsh".to_string()),
+            error_kind: Some("missing_dsh".to_string()),
+        };
+        let json = serde_json::to_value(&state).expect("serialize");
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["error_kind"], "missing_dsh");
+        // 就绪状态不携带 error_kind 字段。
+        let ready = DshState::default();
+        let ready_json = serde_json::to_value(&ready).expect("serialize");
+        assert!(ready_json.get("error_kind").is_none());
+    }
 }
 
 struct AppState {
@@ -277,7 +303,13 @@ fn apply_window_theme(app: &tauri::AppHandle, theme: &str) {
     let _ = app.emit("dsh://theme", serde_json::json!({ "theme": theme }));
 }
 
-fn set_status(app: &tauri::AppHandle, status: &str, url: Option<String>, error: Option<String>) {
+fn set_status(
+    app: &tauri::AppHandle,
+    status: &str,
+    url: Option<String>,
+    error: Option<String>,
+    error_kind: Option<&str>,
+) {
     let state = app.state::<AppState>();
     let snapshot = {
         let mut guard = state.state.lock().unwrap();
@@ -285,6 +317,7 @@ fn set_status(app: &tauri::AppHandle, status: &str, url: Option<String>, error: 
             status: status.to_string(),
             url: url.clone(),
             error,
+            error_kind: error_kind.map(String::from),
         };
         guard.clone()
     };
@@ -323,7 +356,7 @@ fn handle_dsh_event(app: &tauri::AppHandle, event: dsh::DshEvent) {
         dsh::DshEvent::Ready { url } => {
             let port = url.parse::<tauri::Url>().ok().and_then(|parsed| parsed.port());
             *app.state::<AppState>().dsh_port.lock().unwrap() = port;
-            set_status(app, "ready", Some(url.clone()), None);
+            set_status(app, "ready", Some(url.clone()), None, None);
             if let Some(content) = app.get_webview("content") {
                 if let Ok(parsed) = url.parse::<tauri::Url>() {
                     let _ = content.navigate(parsed);
@@ -337,6 +370,7 @@ fn handle_dsh_event(app: &tauri::AppHandle, event: dsh::DshEvent) {
                 "error",
                 None,
                 Some(format!("dsh 启动超时。最近日志：\n{tail}")),
+                Some("boot_timeout"),
             )
         }
         dsh::DshEvent::Exited { requested: false, .. } => {
@@ -346,6 +380,7 @@ fn handle_dsh_event(app: &tauri::AppHandle, event: dsh::DshEvent) {
                 "stopped",
                 None,
                 Some(format!("dsh 进程已退出。最近日志：\n{tail}")),
+                Some("crashed"),
             )
         }
         dsh::DshEvent::Exited { requested: true, .. } => {}
@@ -449,10 +484,16 @@ fn start_dsh(app: &tauri::AppHandle) {
             match dsh::DshProcess::spawn(config, Arc::new(on_event)) {
                 Ok(process) => {
                     *app.state::<AppState>().process.lock().unwrap() = Some(process);
-                    set_status(app, "starting", None, None);
+                    set_status(app, "starting", None, None, None);
                 }
                 Err(error) => {
-                    set_status(app, "error", None, Some(format!("无法启动 dsh：{error}")))
+                    set_status(
+                        app,
+                        "error",
+                        None,
+                        Some(format!("无法启动 dsh：{error}")),
+                        Some("spawn_failed"),
+                    )
                 }
             }
         }
@@ -460,19 +501,22 @@ fn start_dsh(app: &tauri::AppHandle) {
             app,
             "error",
             None,
-            Some("未找到 dsh 命令。请先安装 Node.js ≥22，然后执行：npm i -g @deepseek-ai/dsh".to_string()),
+            Some("未找到 dsh 命令。".to_string()),
+            Some("missing_dsh"),
         ),
         dsh::EnvCheck::MissingNode => set_status(
             app,
             "error",
             None,
-            Some("未找到可用的 Node.js（dsh 需要 ≥22）。请安装或升级 Node.js 后重启。".to_string()),
+            Some("未找到可用的 Node.js。".to_string()),
+            Some("missing_node"),
         ),
         dsh::EnvCheck::NodeTooOld { major } => set_status(
             app,
             "error",
             None,
-            Some(format!("Node.js 版本过低（v{major}），dsh 需要 ≥{}，请升级。", dsh::MIN_NODE_MAJOR)),
+            Some(format!("Node.js 版本过低（v{major}），dsh 需要 ≥{}。", dsh::MIN_NODE_MAJOR)),
+            Some("node_too_old"),
         ),
     }
 }
