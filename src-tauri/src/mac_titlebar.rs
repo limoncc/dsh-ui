@@ -7,8 +7,8 @@ use tauri::Manager;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, Sel};
 use objc2::{class, define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSButton, NSLayoutAttribute, NSTitlebarAccessoryViewController, NSView};
-use objc2_foundation::{NSPoint, NSSize, NSObject as FoundationNSObject, NSObjectProtocol};
+use objc2_app_kit::{NSButton, NSImage, NSLayoutAttribute, NSTitlebarAccessoryViewController, NSView};
+use objc2_foundation::{NSData, NSPoint, NSSize, NSObject as FoundationNSObject, NSObjectProtocol};
 
 /// 控件统一高度、容器高度。
 const CONTROL_H: f64 = 24.0;
@@ -26,7 +26,6 @@ static TARGET: std::sync::OnceLock<TargetPtr> = std::sync::OnceLock::new();
 
 /// 控件句柄（raw pointer，仅主线程读写）。
 struct Controls {
-    container: *mut AnyObject,
     status_btn: *mut AnyObject,
 }
 unsafe impl Send for Controls {}
@@ -80,6 +79,51 @@ impl TitlebarTarget {
     }
 }
 
+/// 状态圆点颜色（RGB）。
+fn status_color(status: &str) -> (u8, u8, u8) {
+    match status {
+        "ready" => (52, 199, 89),             // green
+        "stopped" | "error" => (255, 69, 58), // red
+        _ => (255, 214, 10),                  // yellow
+    }
+}
+
+/// 生成状态圆点图片（2x 分辨率圆形，显示约 10pt）。
+fn dot_image(status: &str) -> *mut NSImage {
+    let (r, g, b) = status_color(status);
+    let size = 24u32;
+    let radius = size as f64 / 2.0;
+    let img = image::RgbaImage::from_fn(size, size, |x, y| {
+        let dx = x as f64 + 0.5 - radius;
+        let dy = y as f64 + 0.5 - radius;
+        if (dx * dx + dy * dy).sqrt() <= radius {
+            image::Rgba([r, g, b, 255])
+        } else {
+            image::Rgba([0, 0, 0, 0])
+        }
+    });
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode dot png");
+    unsafe {
+        let data = NSData::dataWithBytes_length(png.as_ptr().cast(), png.len());
+        let alloc: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let initialized: *mut NSImage = msg_send![alloc, initWithData: &*data];
+        let _: () = msg_send![initialized, setSize: NSSize::new(10.0, 10.0)];
+        initialized
+    }
+}
+
+/// 状态按钮的标题文字（无圆点字符，圆点用彩色图片）。
+fn status_label(status: &str) -> &'static str {
+    match status {
+        "ready" => "已连接",
+        "stopped" => "dsh 已停止",
+        "error" => "启动失败",
+        _ => "启动中",
+    }
+}
+
 /// 生成一个标题栏按钮。
 unsafe fn make_button(
     mtm: MainThreadMarker,
@@ -130,7 +174,13 @@ pub fn rebuild(window: &tauri::Window) -> tauri::Result<()> {
 
     // 从左到右：状态 / 日志 / 设置 / 终端。
     let status_btn = unsafe {
-        make_button(mtm, target_obj, sel!(statusClicked:), "● 启动中")
+        let button = make_button(mtm, target_obj, sel!(statusClicked:), "启动中");
+        let _: () = msg_send![&*button, setImagePosition: 2_i64]; // ImageLeft
+        button
+    };
+    unsafe {
+        let dot = dot_image("starting");
+        let _: () = msg_send![&*status_btn, setImage: &*dot];
     };
     let logs_btn =
         unsafe { make_button(mtm, target_obj, sel!(logsClicked:), "日志") };
@@ -164,17 +214,8 @@ pub fn rebuild(window: &tauri::Window) -> tauri::Result<()> {
         x += widths[idx] + GAP;
     }
     // 状态按钮字号调小，指示点更精致。
-    // 状态按钮字号调小，指示点更精致。
-    unsafe {
-        let small_font: *mut AnyObject = msg_send![
-            class!(NSFont),
-            systemFontOfSize: 11.0_f64
-        ];
-        let _: () = msg_send![&*status_btn, setFont: small_font];
-    }
 
     *CONTROLS.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap() = Some(Controls {
-        container: (&*container as *const NSView) as *mut AnyObject,
         status_btn: (&*status_btn as *const NSButton) as *mut AnyObject,
     });
 
@@ -191,8 +232,9 @@ pub fn rebuild(window: &tauri::Window) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 更新状态按钮文字（"● 已连接" 等）。必须在主线程执行。
-pub fn update_status(status_title: &str) {
+/// 更新状态按钮（彩色圆点图片 + 文字）。必须在主线程执行。
+pub fn update_status(_app: &tauri::AppHandle, status: &str) {
+    let label = status_label(status);
     let Some(lock) = CONTROLS.get() else {
         return;
     };
@@ -200,22 +242,22 @@ pub fn update_status(status_title: &str) {
     if let Some(controls) = guard.as_ref() {
         unsafe {
             let button: &NSButton = &*(controls.status_btn as *const NSButton);
-            button.setTitle(&objc2_foundation::NSString::from_str(status_title));
+            let dot = dot_image(status);
+            let _: () = msg_send![button, setImage: &*dot];
+            button.setTitle(&objc2_foundation::NSString::from_str(label));
             button.sizeToFit();
-            // 更新自身宽度后平移右侧兄弟按钮：直接重建容器内布局。
-            let container: &NSView = &*(controls.container as *const NSView);
             let width = button.frame().size.width;
             button.setFrameSize(NSSize::new(width, CONTROL_H));
             button.setFrameOrigin(NSPoint::new(0.0, (CONTAINER_H - CONTROL_H) / 2.0));
-            let _ = container;
         }
     }
 }
 
 /// 供轮询线程调用的入口：主线程更新状态按钮。
-pub fn update_status_on_main(app: &tauri::AppHandle, status_title: String) {
+pub fn update_status_on_main(app: &tauri::AppHandle, status: String) {
     let handle = app.clone();
+    let callback = handle.clone();
     let _ = handle.run_on_main_thread(move || {
-        update_status(&status_title);
+        update_status(&callback, &status);
     });
 }

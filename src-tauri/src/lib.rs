@@ -887,13 +887,7 @@ pub fn run() {
                     std::thread::sleep(Duration::from_millis(800));
                     let state = poll_handle.state::<AppState>();
                     let snapshot = state.state.lock().unwrap().clone();
-                    let title = match snapshot.status.as_str() {
-                        "ready" => "● 已连接",
-                        "stopped" => "● dsh 已停止",
-                        "error" => "● 启动失败",
-                        _ => "● 启动中",
-                    };
-                    mac_titlebar::update_status_on_main(&poll_handle, title.to_string());
+                    mac_titlebar::update_status_on_main(&poll_handle, snapshot.status.clone());
                 });
             }
             start_dsh(app.handle());
