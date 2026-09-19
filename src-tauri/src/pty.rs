@@ -99,7 +99,7 @@ impl PtySession {
 
     /// 终止 shell（退出 APP / 关闭面板时）。
     pub fn kill(&self) {
-        self.killer.lock().unwrap().kill();
+        let _ = self.killer.lock().unwrap().kill();
     }
 }
 
