@@ -16,8 +16,11 @@
 ## 功能
 
 - 自动拉起/重启 `dsh` 后端；崩溃后底部状态条可一键重启
-- 底部常驻状态条：连接状态、重启、打开日志目录、**在窗口下方打开系统终端**
-- 明暗主题跟随：dsh 页面切换主题时窗口原生外观同步
+- **设置窗口**：自定义 dsh / node 路径（留空 = 自动探测），支持即时测试与保存后自动重启
+  （持久化在 `~/Library/Application Support/com.dsh.ui/config.json`）
+- **内嵌终端**：底部 320px 面板（portable-pty + xterm.js），与主界面分屏、可开合、主题跟随
+- **安装指引**：缺少 Node/dsh 或版本过低时，按错误类型给出分步安装命令（带复制按钮）
+- 明暗主题跟随：dsh 页面切换主题时窗口原生外观、壳页面与终端同步
 - 原生菜单：编辑、缩放（Cmd +=/-/0，25%~500%）
 - 系统托盘（显示/退出）、关窗隐藏到托盘、窗口位置记忆、单实例
 - 导航锁定：仅允许当前 dsh 端口与壳页面，外链转系统浏览器
@@ -39,14 +42,16 @@ npm run build    # 产出 .app 与 .dmg（src-tauri/target/release/bundle/）
 ## 测试
 
 ```sh
-cd src-tauri && cargo test   # 47 个单元/集成测试（含假 dsh 进程生命周期测试）
+cd src-tauri && cargo test   # 单元/集成测试（配置、探测、进程生命周期、PTY 等）
 ```
 
 ## 结构
 
 ```
-ui/                 壳页面（loading / bar，零依赖，经 window.__TAURI__ 通信）
+ui/                 壳页面（loading / bar / settings，零构建，xterm 已 vendored）
 src-tauri/src/
-  dsh.rs            环境探测、就绪行解析、进程状态机、日志（核心，全量单测）
-  lib.rs            窗口/菜单/托盘/主题装配与 Tauri 命令
+  dsh.rs            环境探测、就绪行解析、进程状态机、日志（核心）
+  settings.rs       应用配置（dsh/node 路径自定义）
+  pty.rs            内嵌终端的 PTY 后端
+  lib.rs            窗口/菜单/托盘/布局装配与 Tauri 命令
 ```
