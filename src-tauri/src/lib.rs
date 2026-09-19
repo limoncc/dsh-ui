@@ -1,4 +1,5 @@
 pub mod dsh;
+pub mod pty;
 pub mod settings;
 
 use serde::Serialize;
