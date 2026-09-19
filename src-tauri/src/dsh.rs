@@ -234,21 +234,36 @@ pub struct DshConfig {
     pub kill_grace: Duration,
     /// dsh 的 stdout/stderr 日志落盘路径；None 则只收集尾部不落盘。
     pub log_file: Option<PathBuf>,
+    /// true = 持有子进程 stdin 写端（防孤儿心跳：APP 死 → 管道 EOF → wrapper 杀 dsh）。
+    pub stdin_pipe: bool,
 }
 
+/// 生产 wrapper 脚本：后台启动 dsh，stdin EOF（APP 死亡）时杀掉它。
+/// 这让「退出 APP 必关 dsh」不依赖任何退出回调——连 kill -9 都覆盖。
+pub const DSH_WRAPPER_SCRIPT: &str = r#"
+"$1" web --no-open --port 0 &
+pid=$!
+while IFS= read -r -t 86400 _; do :; done
+kill "$pid" 2>/dev/null
+wait "$pid"
+"#;
+
 impl DshConfig {
-    /// 生产配置：spawn 探测到的 dsh CLI，`--port 0` 由 OS 选空闲端口。
+    /// 生产配置：经 stdin 守护 wrapper 启动 dsh，`--port 0` 由 OS 选空闲端口。
     pub fn real(dsh: &Path, child_path: Option<String>, boot_timeout: Duration) -> Self {
         DshConfig {
-            program: dsh.to_path_buf(),
-            args: ["web", "--no-open", "--port", "0"]
-                .iter()
-                .map(|arg| (*arg).to_string())
-                .collect(),
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                DSH_WRAPPER_SCRIPT.to_string(),
+                "sh".to_string(),
+                dsh.display().to_string(),
+            ],
             child_path,
             boot_timeout,
             kill_grace: Duration::from_secs(3),
             log_file: log_dir().map(|dir| dir.join("dsh.log")),
+            stdin_pipe: true,
         }
     }
 }
@@ -272,6 +287,8 @@ struct Shared {
     exit_reported: AtomicBool,
     /// stderr 尾部环形缓冲（错误页展示用）。
     stderr_tail: Mutex<Vec<u8>>,
+    /// 子进程 stdin 写端（stdin_pipe 时持有；drop 即关闭管道）。
+    stdin_writer: Mutex<Option<std::process::ChildStdin>>,
 }
 
 /// dsh 子进程句柄：spawn 后由内部线程驱动事件，`stop` 负责进程组终止。
@@ -292,8 +309,13 @@ impl DshProcess {
         if let Some(path) = &config.child_path {
             command.env("PATH", path);
         }
+        if config.stdin_pipe {
+            // 防孤儿心跳：持有写端；APP 死亡 → 管道 EOF → wrapper 杀 dsh。
+            command.stdin(std::process::Stdio::piped());
+        } else {
+            command.stdin(std::process::Stdio::null());
+        }
         command
-            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         // 独立进程组：退出时可整组终止 dsh 及其子进程。
@@ -308,6 +330,7 @@ impl DshProcess {
         let pid = child.id() as i32;
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
+        let stdin_writer = child.stdin.take();
 
         // 日志文件（truncate 每次启动）；目录不存在时放弃落盘，不影响运行。
         let log_file = config.log_file.as_deref().and_then(|path| {
@@ -324,6 +347,7 @@ impl DshProcess {
             stop_requested: AtomicBool::new(false),
             exit_reported: AtomicBool::new(false),
             stderr_tail: Mutex::new(Vec::new()),
+            stdin_writer: Mutex::new(stdin_writer),
         });
 
         // stdout 线程：解析就绪行；EOF 后等进程真正退出并报告一次。
@@ -408,6 +432,11 @@ impl DshProcess {
     /// stderr 尾部内容（最多 [`STDERR_TAIL_BYTES`] 字节），供错误页展示。
     pub fn stderr_tail(&self) -> Vec<u8> {
         self.shared.stderr_tail.lock().unwrap().clone()
+    }
+
+    /// 关闭子进程 stdin（防孤儿守护的主动触发：wrapper 检测 EOF 后杀 dsh）。
+    pub fn close_stdin(&self) {
+        *self.shared.stdin_writer.lock().unwrap() = None;
     }
 }
 
@@ -833,6 +862,7 @@ mod process_tests {
             boot_timeout: Duration::from_millis(150),
             kill_grace: Duration::from_millis(300),
             log_file: None,
+            stdin_pipe: false,
         }
     }
 
@@ -886,6 +916,7 @@ mod process_tests {
             boot_timeout: Duration::from_millis(100),
             kill_grace: Duration::from_millis(100),
             log_file: None,
+            stdin_pipe: false,
         };
         let result = DshProcess::spawn(config, Arc::new(|_event| {}));
         assert!(result.is_err(), "expected spawn error for missing binary");
@@ -977,5 +1008,77 @@ mod process_tests {
             other => panic!("expected requested exit after escalation, got {other:?}"),
         }
         assert!(!process.is_running());
+    }
+}
+
+#[cfg(test)]
+mod stdin_guard_tests {
+    use super::{DshConfig, DshEvent, DshProcess};
+    use std::path::PathBuf;
+    use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// 生成「stdin EOF → 杀后台子进程」的 wrapper 脚本（与生产同构）。
+    fn wrapper_config() -> DshConfig {
+        DshConfig {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                r#"
+"$1" marker-arg &
+pid=$!
+echo 'dsh web: http://127.0.0.1:45678/?token=wrapper'
+# stdin EOF（父进程死亡）→ 杀掉后台 dsh
+while IFS= read -r -t 86400 _; do :; done
+kill "$pid" 2>/dev/null
+wait "$pid"
+"#
+                .to_string(),
+                "echo".to_string(),
+            ],
+            child_path: None,
+            boot_timeout: Duration::from_secs(10),
+            kill_grace: Duration::from_millis(300),
+            log_file: None,
+            stdin_pipe: true,
+        }
+    }
+
+    #[test]
+    fn closing_stdin_kills_background_child() {
+        let (tx, rx) = channel::<DshEvent>();
+        let tx = Mutex::new(tx);
+        let process = DshProcess::spawn(
+            wrapper_config(),
+            Arc::new(move |event| {
+                let _ = tx.lock().unwrap().send(event);
+            }),
+        )
+        .expect("spawn wrapper");
+
+        // 等 wrapper 就绪行（证明后台子进程已启动）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wrapper never became ready"
+            );
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(DshEvent::Ready { .. }) => break,
+                Ok(_) => continue,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => panic!("channel closed"),
+            }
+        }
+
+        // 模拟 APP 死亡：关闭 stdin 写端 → wrapper 检测 EOF 并杀后台子进程。
+        process.close_stdin();
+
+        // wrapper 自身随后台子进程退出 → 收到退出事件。
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(DshEvent::Exited { .. }) => {}
+            other => panic!("expected exit after stdin close, got {other:?}"),
+        }
     }
 }

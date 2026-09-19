@@ -194,6 +194,12 @@ fn get_dsh_state(state: State<'_, AppState>) -> DshState {
     state.state.lock().unwrap().clone()
 }
 
+/// 诊断命令：壳页面把 JS 侧 API 状态回传，Rust 打到 stderr（dev 日志可见）。
+#[tauri::command]
+fn diag_report(source: String, info: String) {
+    eprintln!("[diag] {source}: {info}");
+}
+
 /// Tauri 命令：重启 dsh（停止旧进程后重新探测并 spawn）。
 #[tauri::command]
 fn restart_dsh(app: tauri::AppHandle) {
@@ -689,6 +695,8 @@ fn request_quit(app: tauri::AppHandle) {
         }
         let process = state.process.lock().unwrap().take();
         if let Some(process) = process {
+            // 先关 stdin（wrapper 检测 EOF 自杀 dsh），SIGTERM 作双保险。
+            process.close_stdin();
             process.stop();
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             while process.is_running() && std::time::Instant::now() < deadline {
@@ -786,6 +794,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_dsh_state,
+            diag_report,
             report_theme,
             restart_dsh,
             open_log_dir,

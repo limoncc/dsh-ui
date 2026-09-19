@@ -121,6 +121,24 @@
     </style>
   </head>
   <body>
+    <!-- 诊断条（临时）：显示 JS 侧真实状态，排查后删除 -->
+    <div
+      id="diag"
+      style="
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        font: 11px ui-monospace, Menlo, monospace;
+        background: #ffe600;
+        color: #000;
+        z-index: 99999;
+        padding: 3px 8px;
+        word-break: break-all;
+      "
+    >
+      DIAG: script running…
+    </div>
     <!-- 启动中 -->
     <div class="box center" id="booting">
       <div class="title">正在启动 DeepSeek Harness…</div>
@@ -141,6 +159,52 @@
 
     <script>
       const T = window.__TAURI__;
+
+      // 诊断（临时）：把状态同时写进页面诊断条与 Rust 日志。
+      (function () {
+        var diagEl = document.getElementById('diag');
+        function show(text) {
+          diagEl.textContent = 'DIAG: ' + text;
+        }
+        function send(text) {
+          show(text);
+          try {
+            window.__TAURI_INTERNALS__.invoke('diag_report', {
+              source: 'loading',
+              info: text,
+            });
+          } catch (e) {
+            show('send-fail: ' + e);
+          }
+        }
+        send(
+          'T=' +
+            typeof T +
+            ' internals=' +
+            typeof window.__TAURI_INTERNALS__ +
+            ' invoke=' +
+            (window.__TAURI_INTERNALS__ ? typeof window.__TAURI_INTERNALS__.invoke : 'n/a')
+        );
+        if (window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === 'function') {
+          window.__TAURI_INTERNALS__
+            .invoke('diag_report', { source: 'loading-promise', info: 'roundtrip' })
+            .then(
+              function () {
+                show('PROMISE RESOLVED');
+                send('promise RESOLVED');
+              },
+              function (e) {
+                show('PROMISE REJECTED: ' + e);
+                send('promise REJECTED: ' + e);
+              }
+            );
+          setTimeout(function () {
+            if (diagEl.textContent.indexOf('PROMISE') === -1) {
+              show('PROMISE STILL PENDING after 4s — IPC 响应未返回');
+            }
+          }, 4000);
+        }
+      })();
 
       // 按错误类型渲染的安装指引；steps 中 cmd 会被渲染成可复制的命令块。
       const GUIDES = {

@@ -88,6 +88,24 @@
     </style>
   </head>
   <body>
+    <!-- 诊断条（临时）：显示 JS 侧真实状态，排查后删除 -->
+    <div
+      id="diag"
+      style="
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        font: 10px ui-monospace, Menlo, monospace;
+        background: #ffe600;
+        color: #000;
+        z-index: 99999;
+        padding: 2px 6px;
+        word-break: break-all;
+      "
+    >
+      DIAG: script running…
+    </div>
     <div id="terminal-container"></div>
     <div class="bar-row">
       <div class="status">
@@ -105,6 +123,65 @@
     <script src="vendor/xterm.js"></script>
     <script src="vendor/addon-fit.js"></script>
     <script>
+      // 诊断：把 JS 侧 API 状态回传 Rust（internals.invoke 是基础桥，必在）。
+      (function () {
+        var internals = window.__TAURI_INTERNALS__;
+        var diagEl = document.getElementById('diag');
+        function showDiag(text) {
+          if (diagEl) diagEl.textContent = 'DIAG: ' + text;
+        }
+        var info = {
+          hasTauri: typeof window.__TAURI__,
+          tauriKeys:
+            window.__TAURI__ ? Object.keys(window.__TAURI__).join(',') : 'n/a',
+          hasInternals: typeof internals,
+          internalsKeys: internals ? Object.keys(internals).join(',') : 'n/a',
+          hasTransformCallback: internals ? typeof internals.transformCallback : 'n/a',
+        };
+        function send(text) {
+          try {
+            internals.invoke('diag_report', { source: 'bar', info: text });
+          } catch (e) {
+            document.title = 'DIAG-FAIL:' + e;
+          }
+        }
+        send(JSON.stringify(info));
+        // 响应回路测试：invoke 的 promise 能否 settle。
+        if (internals && typeof internals.invoke === 'function') {
+          internals
+            .invoke('diag_report', { source: 'bar-promise', info: 'roundtrip' })
+            .then(
+              function () {
+                showDiag('PROMISE RESOLVED — IPC 响应回路正常');
+                send('internals.invoke promise RESOLVED');
+              },
+              function (e) {
+                showDiag('PROMISE REJECTED: ' + e);
+                send('internals.invoke promise REJECTED: ' + e);
+              }
+            );
+          setTimeout(function () {
+            if (diagEl.textContent.indexOf('PROMISE') === -1) {
+              showDiag('PROMISE STILL PENDING after 4s — IPC 响应未返回');
+            }
+          }, 4000);
+        } else {
+          showDiag('internals.invoke NOT A FUNCTION');
+          send('internals.invoke NOT A FUNCTION');
+        }
+        if (window.__TAURI__ && window.__TAURI__.core) {
+          window.__TAURI__.core
+            .invoke('diag_report', { source: 'bar-global', info: 'roundtrip' })
+            .then(
+              function () {
+                send('global invoke promise RESOLVED');
+              },
+              function (e) {
+                send('global invoke promise REJECTED: ' + e);
+              }
+            );
+        }
+      })();
       const T = window.__TAURI__;
       const LABELS = {
         starting: '启动中…',
@@ -184,41 +261,80 @@
         window.addEventListener('resize', fitTerminal);
       }
 
+      function reportDiag(label, error) {
+        try {
+          window.__TAURI_INTERNALS__.invoke('diag_report', {
+            source: 'bar-bind',
+            info: label + ' -> ' + (error && error.message ? error.message : String(error)),
+          });
+        } catch (e) {}
+      }
+      function safe(label, fn) {
+        try {
+          fn();
+        } catch (e) {
+          reportDiag(label, e);
+        }
+      }
+
       if (T) {
-        T.event.listen('dsh://state', (event) => apply(event.payload));
-        T.event.listen('dsh://theme', (event) => setTheme(event.payload.theme));
-        T.event.listen('pty://output', (event) => {
-          if (term) term.write(base64ToBytes(event.payload));
+        safe('listen-state', () =>
+          T.event.listen('dsh://state', (event) => apply(event.payload))
+        );
+        safe('listen-theme', () =>
+          T.event.listen('dsh://theme', (event) => setTheme(event.payload.theme))
+        );
+        safe('listen-pty-output', () =>
+          T.event.listen('pty://output', (event) => {
+            if (term) term.write(base64ToBytes(event.payload));
+          })
+        );
+        safe('listen-pty-exit', () =>
+          T.event.listen('pty://exit', () => {
+            if (term) term.writeln('\r\n\x1b[2m[shell 已退出]\x1b[0m');
+          })
+        );
+        safe('get-state', () => {
+          T.core.invoke('get_dsh_state')
+            .then((state) => {
+              reportDiag('get_dsh_state ok', 'status=' + state.status);
+              apply(state);
+            })
+            .catch((e) => reportDiag('get_dsh_state', e));
         });
-        T.event.listen('pty://exit', () => {
-          if (term) term.writeln('\r\n\x1b[2m[shell 已退出]\x1b[0m');
+        safe('bind-logs', () => {
+          document.getElementById('logs').addEventListener('click', () => {
+            T.core.invoke('open_log_dir').catch((e) => reportDiag('open_log_dir', e));
+          });
         });
-        T.core.invoke('get_dsh_state').then(apply).catch(() => {});
-        document.getElementById('logs').addEventListener('click', () => {
-          T.core.invoke('open_log_dir').catch(() => {});
+        safe('bind-settings', () => {
+          document.getElementById('settings').addEventListener('click', () => {
+            T.core.invoke('open_settings').catch((e) => reportDiag('open_settings', e));
+          });
         });
-        document.getElementById('settings').addEventListener('click', () => {
-          T.core.invoke('open_settings').catch(() => {});
+        safe('bind-restart', () => {
+          document.getElementById('restart').addEventListener('click', () => {
+            T.core.invoke('restart_dsh').catch((e) => reportDiag('restart_dsh', e));
+          });
         });
-        document.getElementById('restart').addEventListener('click', () => {
-          T.core.invoke('restart_dsh').catch(() => {});
-        });
-        document.getElementById('terminal').addEventListener('click', async () => {
-          try {
-            const open = await T.core.invoke('terminal_toggle');
-            document.body.classList.toggle('terminal-open', open);
-            document.getElementById('terminal').classList.toggle('active', open);
-            if (open) {
-              initTerminal();
-              // 等 Rust 侧布局生效后再 fit 并聚焦。
-              requestAnimationFrame(() => {
-                fitTerminal();
-                if (term) term.focus();
-              });
+        safe('bind-terminal', () => {
+          document.getElementById('terminal').addEventListener('click', async () => {
+            try {
+              const open = await T.core.invoke('terminal_toggle');
+              document.body.classList.toggle('terminal-open', open);
+              document.getElementById('terminal').classList.toggle('active', open);
+              if (open) {
+                initTerminal();
+                // 等 Rust 侧布局生效后再 fit 并聚焦。
+                requestAnimationFrame(() => {
+                  fitTerminal();
+                  if (term) term.focus();
+                });
+              }
+            } catch (e) {
+              reportDiag('terminal_toggle', e);
             }
-          } catch (e) {
-            console.error('terminal_toggle failed', e);
-          }
+          });
         });
       }
     </script>
