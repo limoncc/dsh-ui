@@ -8,6 +8,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, Sel};
 use objc2::{class, define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{NSButton, NSImage, NSLayoutAttribute, NSTitlebarAccessoryViewController, NSView};
+use std::sync::Mutex;
 use objc2_foundation::{NSData, NSPoint, NSSize, NSObject as FoundationNSObject, NSObjectProtocol};
 
 /// 控件统一高度、容器高度。
@@ -27,6 +28,10 @@ static TARGET: std::sync::OnceLock<TargetPtr> = std::sync::OnceLock::new();
 /// 控件句柄（raw pointer，仅主线程读写）。
 struct Controls {
     status_btn: *mut AnyObject,
+    logs_btn: *mut AnyObject,
+    settings_btn: *mut AnyObject,
+    /// 上次状态文字（轮询幂等跳过）。
+    last_status: Mutex<String>,
 }
 unsafe impl Send for Controls {}
 static CONTROLS: std::sync::OnceLock<std::sync::Mutex<Option<Controls>>> =
@@ -206,6 +211,9 @@ pub fn rebuild(window: &tauri::Window) -> tauri::Result<()> {
 
     *CONTROLS.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap() = Some(Controls {
         status_btn: (&*status_btn as *const NSButton) as *mut AnyObject,
+        logs_btn: (&*logs_btn as *const NSButton) as *mut AnyObject,
+        settings_btn: (&*settings_btn as *const NSButton) as *mut AnyObject,
+        last_status: Mutex::new(String::new()),
     });
 
     // 挂到标题栏右侧。
@@ -221,23 +229,45 @@ pub fn rebuild(window: &tauri::Window) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 更新状态按钮（彩色圆点图片 + 文字）。必须在主线程执行。
+/// 更新状态按钮（彩色圆点图片 + 文字），并把右侧按钮重排到新宽度之后。
+/// 状态未变化时跳过（轮询幂等）。必须在主线程执行。
 pub fn update_status(_app: &tauri::AppHandle, status: &str) {
     let label = status_label(status);
     let Some(lock) = CONTROLS.get() else {
         return;
     };
     let guard = lock.lock().unwrap();
-    if let Some(controls) = guard.as_ref() {
-        unsafe {
-            let button: &NSButton = &*(controls.status_btn as *const NSButton);
-            let dot = dot_image(status);
-            let _: () = msg_send![button, setImage: &*dot];
-            button.setTitle(&objc2_foundation::NSString::from_str(label));
-            button.sizeToFit();
-            let width = button.frame().size.width;
-            button.setFrameSize(NSSize::new(width, CONTROL_H));
-            button.setFrameOrigin(NSPoint::new(0.0, (CONTAINER_H - CONTROL_H) / 2.0));
+    let Some(controls) = guard.as_ref() else {
+        return;
+    };
+    {
+        let mut last = controls.last_status.lock().unwrap();
+        if *last == status {
+            return;
+        }
+        *last = status.to_string();
+    }
+    unsafe {
+        let status_btn: &NSButton = &*(controls.status_btn as *const NSButton);
+        let logs_btn: &NSButton = &*(controls.logs_btn as *const NSButton);
+        let settings_btn: &NSButton = &*(controls.settings_btn as *const NSButton);
+
+        let dot = dot_image(status);
+        let _: () = msg_send![status_btn, setImage: &*dot];
+        status_btn.setTitle(&objc2_foundation::NSString::from_str(label));
+        status_btn.sizeToFit();
+
+        // 重排整行：状态在最左（宽度随文字伸缩），右侧按钮依次右移。
+        let mid_y = (CONTAINER_H - CONTROL_H) / 2.0;
+        let status_w = status_btn.frame().size.width;
+        status_btn.setFrameSize(NSSize::new(status_w, CONTROL_H));
+        status_btn.setFrameOrigin(NSPoint::new(0.0, mid_y));
+
+        let mut x = status_w + GAP;
+        for button in [logs_btn, settings_btn] {
+            let w = button.frame().size.width;
+            button.setFrameOrigin(NSPoint::new(x, mid_y));
+            x += w + GAP;
         }
     }
 }
