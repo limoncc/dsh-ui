@@ -179,3 +179,41 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod real_shell_tests {
+    use super::{PtyConfig, PtySession};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// 真实 zsh 交互 shell：2 秒内应产生输出（提示符）。
+    #[test]
+    fn real_zsh_interactive_produces_output() {
+        let collected = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let collected2 = collected.clone();
+        let session = PtySession::spawn(
+            PtyConfig {
+                shell: PathBuf::from("/bin/zsh"),
+                args: vec!["-f".to_string()],
+                cwd: std::env::temp_dir(),
+                rows: 24,
+                cols: 80,
+            },
+            Arc::new(move |bytes| {
+                collected2.lock().unwrap().extend_from_slice(&bytes);
+            }),
+            Box::new(|_| {}),
+        )
+        .expect("spawn real zsh");
+
+        std::thread::sleep(Duration::from_secs(2));
+        let out = collected.lock().unwrap().clone();
+        session.kill();
+        assert!(
+            !out.is_empty(),
+            "真实 zsh 交互模式应有输出（提示符），实际 0 字节"
+        );
+    }
+}
+

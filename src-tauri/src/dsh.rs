@@ -1110,3 +1110,4 @@ mod theme_nav_tests {
         assert_eq!(parse_theme_navigation(""), None);
     }
 }
+

@@ -74,9 +74,6 @@ const THEME_DETECT_SCRIPT: &str = r#"
 })();
 "#;
 
-/// 内嵌终端面板高度（逻辑像素）。
-const TERMINAL_HEIGHT: f64 = 320.0;
-
 /// dsh 启动就绪的最长等待时间；可用 `DSH_UI_BOOT_TIMEOUT` 环境变量覆盖（秒）。
 const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 30;
 
@@ -172,8 +169,6 @@ struct AppState {
     dsh_port: Mutex<Option<u16>>,
     /// content webview 当前缩放（百分比）。
     zoom: AtomicU32,
-    /// 内嵌终端面板是否展开。
-    terminal_open: std::sync::atomic::AtomicBool,
     /// 内嵌终端的 PTY 会话（首次展开时创建）。
     pty: Mutex<Option<pty::PtySession>>,
     /// PTY 输出环形缓冲：前端按 offset 拉取（可靠通道，不走事件）。
@@ -330,16 +325,48 @@ fn spawn_pty(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 开合内嵌终端（标题栏按钮与命令共用），返回开合后的状态。
+/// 开/关独立终端窗口（贴主窗口正下方），返回开启后的状态。
 pub(crate) fn toggle_terminal_impl(app: &tauri::AppHandle) -> Result<bool, String> {
-    let state = app.state::<AppState>();
-    let open = !state.terminal_open.load(Ordering::Relaxed);
-    state.terminal_open.store(open, Ordering::Relaxed);
-    if open {
-        spawn_pty(app)?;
+    if let Some(window) = app.get_webview_window("terminal") {
+        // 已开 → 关闭窗口并终止 shell。
+        let _ = window.close();
+        *app.state::<AppState>().pty.lock().unwrap() = None;
+        return Ok(false);
     }
-    relayout(app);
-    Ok(open)
+    spawn_pty(app)?;
+    // 计算位置：主窗口正下方（逻辑坐标）。
+    let (x, y, w) = terminal_window_position(app);
+    tauri::WebviewWindowBuilder::new(
+        app,
+        "terminal",
+        tauri::WebviewUrl::App("terminal.html".into()),
+    )
+    .title("终端")
+    .inner_size(w.max(420.0), 360.0)
+    .position(x, y)
+    .build()
+    .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+/// 计算终端窗口的位置（主窗正下方，屏幕内钳制）。
+fn terminal_window_position(app: &tauri::AppHandle) -> (f64, f64, f64) {
+    let Some(window) = app.get_window("main") else {
+        return (100.0, 100.0, 800.0);
+    };
+    let Ok(pos) = window.outer_position() else {
+        return (100.0, 100.0, 800.0);
+    };
+    let Ok(size) = window.outer_size() else {
+        return (100.0, 100.0, 800.0);
+    };
+    let Ok(scale) = window.scale_factor() else {
+        return (100.0, 100.0, 800.0);
+    };
+    let width = f64::from(size.width) / scale;
+    let bottom = (f64::from(pos.y) + f64::from(size.height)) / scale + 8.0;
+    let x = f64::from(pos.x) / scale;
+    (x, bottom, width)
 }
 
 /// Tauri 命令：开合内嵌终端面板（terminal.html 轮询触发自身初始化）。
@@ -366,12 +393,6 @@ fn pty_resize(state: tauri::State<'_, AppState>, rows: u16, cols: u16) -> Result
         Some(session) => session.resize(rows, cols).map_err(|error| error.to_string()),
         None => Ok(()),
     }
-}
-
-/// Tauri 命令：查询终端面板开合状态（terminal.html 轮询）。
-#[tauri::command]
-fn get_terminal_open(state: tauri::State<'_, AppState>) -> bool {
-    state.terminal_open.load(Ordering::Relaxed)
 }
 
 /// pty_read 的返回：新输出（base64）+ 新游标 + shell 是否已退出。
@@ -656,8 +677,8 @@ fn start_dsh(app: &tauri::AppHandle) {
     }
 }
 
-/// 按终端开合状态重排 content / terminal 两个 webview（逻辑坐标）。
-/// 收起时终端高度为 0（不占任何空间），content 铺满窗口。
+/// 按终端开合状态重排：展开时终端面板贴底（320）、content 上缩；
+/// 收起时终端隐藏、content 铺满。隐藏的 webview 仍保持加载与运行。
 fn relayout(app: &tauri::AppHandle) {
     let Some(window) = app.get_window("main") else {
         return;
@@ -669,29 +690,17 @@ fn relayout(app: &tauri::AppHandle) {
         return;
     };
     let inner_logical = inner.to_logical::<f64>(scale);
-    let term_height = if app.state::<AppState>().terminal_open.load(Ordering::Relaxed) {
-        TERMINAL_HEIGHT
-    } else {
-        0.0
-    };
-    let content_height = (inner_logical.height - term_height).max(0.0);
+    let content_height = inner_logical.height;
     if let Some(content) = app.get_webview("content") {
         let _ = content.set_bounds(tauri::Rect {
             position: tauri::LogicalPosition::new(0.0, 0.0).into(),
             size: tauri::LogicalSize::new(inner_logical.width, content_height).into(),
         });
     }
-    if let Some(terminal) = app.get_webview("terminal") {
-        let _ = terminal.set_bounds(tauri::Rect {
-            position: tauri::LogicalPosition::new(0.0, content_height).into(),
-            size: tauri::LogicalSize::new(inner_logical.width, term_height).into(),
-        });
-    }
 }
 
-/// 装配主窗口：content（dsh 页面/loading）+ terminal（内嵌终端面板）双 webview。
-///
-/// 布局全手动（不用 auto_resize），窗口变化与终端开合都由 [`relayout`] 重排。
+/// 装配主窗口：content（dsh 页面/loading）单 webview 铺满。
+/// 终端为独立窗口（[`toggle_terminal_impl`]），窗口变化时由 [`relayout`] 重排 content。
 fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry>> {
     let window = WindowBuilder::new(app, "main")
         .title("dsh-ui")
@@ -741,13 +750,6 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry
         tauri::LogicalSize::new(width, content_height),
     )?;
 
-    // 内嵌终端面板：常驻 webview，初始高度 0（收起），由标题栏按钮开合。
-    let terminal = WebviewBuilder::new("terminal", WebviewUrl::App("terminal.html".into()));
-    window.add_child(
-        terminal,
-        tauri::LogicalPosition::new(0.0, content_height),
-        tauri::LogicalSize::new(width, 0.0),
-    )?;
     Ok(window)
 }
 
@@ -887,7 +889,6 @@ pub fn run() {
             state: Mutex::new(DshState::default()),
             dsh_port: Mutex::new(None),
             zoom: AtomicU32::new(100),
-            terminal_open: std::sync::atomic::AtomicBool::new(false),
             pty: Mutex::new(None),
             pty_out: Arc::new(PtyOutput::default()),
             theme: Mutex::new("light".to_string()),
@@ -923,8 +924,7 @@ pub fn run() {
             terminal_toggle,
             pty_write,
             pty_read,
-            pty_resize,
-            get_terminal_open
+            pty_resize
         ])
         .setup(|app| {
             let window = build_main_window(app)?;
@@ -963,6 +963,27 @@ pub fn run() {
                     let state = poll_handle.state::<AppState>();
                     let snapshot = state.state.lock().unwrap().clone();
                     mac_titlebar::update_status_on_main(&poll_handle, snapshot.status.clone());
+                });
+            }
+            // 临时诊断：探测 terminal webview 的页面加载与 JS 状态。
+            {
+                let diag_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(4));
+                    if let Some(t) = diag_handle.get_webview("terminal") {
+                        let _ = t.eval(
+                            "document.title = 'TI:' + String(!!window.__TAURI_INTERNALS__) + ':' + String(typeof window.Terminal)",
+                        );
+                    }
+                    for _ in 0..3 {
+                        std::thread::sleep(Duration::from_millis(1500));
+                        if let Some(t) = diag_handle.get_webview("terminal") {
+                            eprintln!(
+                                "[diag-terminal] url={:?}",
+                                t.url().map(|u| u.to_string()).unwrap_or_default()
+                            );
+                        }
+                    }
                 });
             }
             start_dsh(app.handle());
