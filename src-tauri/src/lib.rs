@@ -13,6 +13,9 @@ use tauri::webview::WebviewBuilder;
 use tauri::window::WindowBuilder;
 use tauri::{Emitter, Listener, Manager, State, WebviewUrl};
 
+/// 内嵌终端面板高度（逻辑像素）。
+const TERMINAL_HEIGHT: f64 = 320.0;
+
 /// 注入 dsh 页面：检测网页明暗主题。
 ///
 /// 上报通道是「导航信号」：主题变化时把 `location.href` 指到
@@ -171,6 +174,8 @@ struct AppState {
     zoom: AtomicU32,
     /// 内嵌终端的 PTY 会话（首次展开时创建）。
     pty: Mutex<Option<pty::PtySession>>,
+    /// 内嵌终端面板是否展开。
+    terminal_open: std::sync::atomic::AtomicBool,
     /// PTY 输出环形缓冲：前端按 offset 拉取（可靠通道，不走事件）。
     pty_out: Arc<PtyOutput>,
     /// 当前主题（"light"/"dark"），供壳页面轮询。
@@ -328,46 +333,14 @@ fn spawn_pty(app: &tauri::AppHandle) -> Result<(), String> {
 
 /// 开/关独立终端窗口（贴主窗口正下方），返回开启后的状态。
 pub(crate) fn toggle_terminal_impl(app: &tauri::AppHandle) -> Result<bool, String> {
-    if let Some(window) = app.get_webview_window("terminal") {
-        // 已开 → 关闭窗口并终止 shell。
-        let _ = window.close();
-        *app.state::<AppState>().pty.lock().unwrap() = None;
-        return Ok(false);
+    let state = app.state::<AppState>();
+    let open = !state.terminal_open.load(Ordering::Relaxed);
+    state.terminal_open.store(open, Ordering::Relaxed);
+    if open {
+        spawn_pty(app)?;
     }
-    spawn_pty(app)?;
-    // 计算位置：主窗口正下方（逻辑坐标）。
-    let (x, y, w) = terminal_window_position(app);
-    tauri::WebviewWindowBuilder::new(
-        app,
-        "terminal",
-        tauri::WebviewUrl::App("terminal.html".into()),
-    )
-    .title("终端")
-    .inner_size(w.max(420.0), 360.0)
-    .position(x, y)
-    .build()
-    .map_err(|error| error.to_string())?;
-    Ok(true)
-}
-
-/// 计算终端窗口的位置（主窗正下方，屏幕内钳制）。
-fn terminal_window_position(app: &tauri::AppHandle) -> (f64, f64, f64) {
-    let Some(window) = app.get_window("main") else {
-        return (100.0, 100.0, 800.0);
-    };
-    let Ok(pos) = window.outer_position() else {
-        return (100.0, 100.0, 800.0);
-    };
-    let Ok(size) = window.outer_size() else {
-        return (100.0, 100.0, 800.0);
-    };
-    let Ok(scale) = window.scale_factor() else {
-        return (100.0, 100.0, 800.0);
-    };
-    let width = f64::from(size.width) / scale;
-    let bottom = (f64::from(pos.y) + f64::from(size.height)) / scale + 8.0;
-    let x = f64::from(pos.x) / scale;
-    (x, bottom, width)
+    relayout(app);
+    Ok(open)
 }
 
 /// Tauri 命令：开合内嵌终端面板（terminal.html 轮询触发自身初始化）。
@@ -691,17 +664,25 @@ fn relayout(app: &tauri::AppHandle) {
         return;
     };
     let inner_logical = inner.to_logical::<f64>(scale);
-    let content_height = inner_logical.height;
+    let open = app.state::<AppState>().terminal_open.load(Ordering::Relaxed);
+    let term_height = if open { TERMINAL_HEIGHT } else { 0.0 };
+    let content_height = (inner_logical.height - term_height).max(0.0);
     if let Some(content) = app.get_webview("content") {
         let _ = content.set_bounds(tauri::Rect {
             position: tauri::LogicalPosition::new(0.0, 0.0).into(),
             size: tauri::LogicalSize::new(inner_logical.width, content_height).into(),
         });
     }
+    if let Some(terminal) = app.get_webview("terminal") {
+        let _ = terminal.set_bounds(tauri::Rect {
+            position: tauri::LogicalPosition::new(0.0, content_height).into(),
+            size: tauri::LogicalSize::new(inner_logical.width, term_height).into(),
+        });
+    }
 }
 
-/// 装配主窗口：content（dsh 页面/loading）单 webview 铺满。
-/// 终端为独立窗口（[`toggle_terminal_impl`]），窗口变化时由 [`relayout`] 重排 content。
+/// 装配主窗口：content（dsh 页面/loading）+ terminal（内嵌终端面板）双 webview。
+/// 终端面板收起时高度为 0；窗口变化与开合由 [`relayout`] 重排。
 fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry>> {
     let window = WindowBuilder::new(app, "main")
         .title("dsh-ui")
@@ -751,6 +732,13 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry
         tauri::LogicalSize::new(width, content_height),
     )?;
 
+    // 内嵌终端面板：常驻 webview（320 高），由 relayout 控制显隐与布局。
+    let terminal = WebviewBuilder::new("terminal", WebviewUrl::App("terminal.html".into()));
+    window.add_child(
+        terminal,
+        tauri::LogicalPosition::new(0.0, content_height),
+        tauri::LogicalSize::new(width, TERMINAL_HEIGHT),
+    )?;
     Ok(window)
 }
 
@@ -891,6 +879,7 @@ pub fn run() {
             dsh_port: Mutex::new(None),
             zoom: AtomicU32::new(100),
             pty: Mutex::new(None),
+            terminal_open: std::sync::atomic::AtomicBool::new(false),
             pty_out: Arc::new(PtyOutput::default()),
             theme: Mutex::new("light".to_string()),
         })
