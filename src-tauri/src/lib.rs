@@ -352,14 +352,83 @@ fn handle_dsh_event(app: &tauri::AppHandle, event: dsh::DshEvent) {
     }
 }
 
+/// 应用配置目录（`~/Library/Application Support/com.dsh.ui`）。
+fn config_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok()
+}
+
+#[tauri::command]
+fn get_config(app: tauri::AppHandle) -> settings::AppConfig {
+    config_dir(&app).map(|dir| settings::load(&dir)).unwrap_or_default()
+}
+
+/// 保存配置并用新配置重启 dsh。
+#[tauri::command]
+fn save_config(app: tauri::AppHandle, config: settings::AppConfig) -> Result<(), String> {
+    let dir = config_dir(&app).ok_or_else(|| "无法确定配置目录".to_string())?;
+    settings::save(&dir, &config).map_err(|error| error.to_string())?;
+    if let Some(process) = app.state::<AppState>().process.lock().unwrap().take() {
+        process.stop();
+    }
+    start_dsh(&app);
+    Ok(())
+}
+
+/// 打开设置窗口（已存在则聚焦）。
+#[tauri::command]
+fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("settings") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "settings",
+        tauri::WebviewUrl::App("settings.html".into()),
+    )
+    .title("dsh-ui 设置")
+    .inner_size(520.0, 400.0)
+    .resizable(false)
+    .build()
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// 设置窗口的"测试"按钮：按当前输入做一次探测，返回人话结果。
+#[tauri::command]
+fn test_environment(
+    dsh_path: Option<String>,
+    node_path: Option<String>,
+) -> Result<String, String> {
+    let overrides = dsh::EnvOverrides {
+        dsh: settings::normalize_input(&dsh_path).map(PathBuf::from),
+        node: settings::normalize_input(&node_path).map(PathBuf::from),
+    };
+    let path_env = std::env::var("PATH").ok();
+    match dsh::detect_environment(path_env.as_deref(), &overrides) {
+        dsh::EnvCheck::Ok(env) => Ok(format!(
+            "✅ 就绪\ndsh: {}\nnode: {} (v{})",
+            env.dsh_path.display(),
+            env.node_path.display(),
+            env.node_major
+        )),
+        dsh::EnvCheck::MissingDsh => {
+            Err("未找到可用的 dsh：路径无效、不可执行，或留空时自动探测失败".to_string())
+        }
+        dsh::EnvCheck::MissingNode => Err("未找到可用的 Node.js（需要 ≥22）".to_string()),
+        dsh::EnvCheck::NodeTooOld { major } => {
+            Err(format!("Node.js 版本过低（v{major}），dsh 需要 ≥{}", dsh::MIN_NODE_MAJOR))
+        }
+    }
+}
+
 /// 探测环境并 spawn dsh；任何失败都落到 error 态并给出安装指引。
 fn start_dsh(app: &tauri::AppHandle) {
     let path_env = std::env::var("PATH").ok();
-    let config = settings::load(
-        &app.path()
-            .app_config_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from(".")),
-    );
+    let config = config_dir(app)
+        .map(|dir| settings::load(&dir))
+        .unwrap_or_default();
     let overrides = dsh::EnvOverrides {
         dsh: settings::normalize_input(&config.dsh_path).map(PathBuf::from),
         node: settings::normalize_input(&config.node_path).map(PathBuf::from),
@@ -687,7 +756,11 @@ pub fn run() {
             report_theme,
             restart_dsh,
             open_log_dir,
-            open_terminal
+            open_terminal,
+            get_config,
+            save_config,
+            open_settings,
+            test_environment
         ])
         .setup(|app| {
             build_main_window(app)?;
