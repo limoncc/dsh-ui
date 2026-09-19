@@ -1,6 +1,8 @@
 pub mod dsh;
+pub mod settings;
 
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -353,7 +355,16 @@ fn handle_dsh_event(app: &tauri::AppHandle, event: dsh::DshEvent) {
 /// 探测环境并 spawn dsh；任何失败都落到 error 态并给出安装指引。
 fn start_dsh(app: &tauri::AppHandle) {
     let path_env = std::env::var("PATH").ok();
-    match dsh::detect_environment(path_env.as_deref()) {
+    let config = settings::load(
+        &app.path()
+            .app_config_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
+    let overrides = dsh::EnvOverrides {
+        dsh: settings::normalize_input(&config.dsh_path).map(PathBuf::from),
+        node: settings::normalize_input(&config.node_path).map(PathBuf::from),
+    };
+    match dsh::detect_environment(path_env.as_deref(), &overrides) {
         dsh::EnvCheck::Ok(env) => {
             let child_path = dsh::child_path(
                 &[

@@ -93,6 +93,28 @@ fn run_and_capture_output(program: &Path, args: &[&str]) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+/// 判断路径是否指向一个可执行的常规文件。
+fn is_executable_path(file: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(file)
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(file).map(|meta| meta.is_file()).unwrap_or(false)
+    }
+}
+
+/// 探测 override：用户在设置里手动指定的 dsh/node 路径；Some 时跳过自动探测。
+#[derive(Debug, Default, Clone)]
+pub struct EnvOverrides {
+    pub dsh: Option<PathBuf>,
+    pub node: Option<PathBuf>,
+}
+
 /// webview 导航放行判定。
 ///
 /// 仅放行两类地址：本地壳页面（loading/bar 等 `tauri://localhost` 页面），
@@ -123,20 +145,36 @@ pub fn normalize_theme(theme: &str) -> &'static str {
     }
 }
 
-/// 按 PATH 与 GUI 常见目录探测 dsh 与 node，并校验 node 版本。
-pub fn detect_environment(path_env: Option<&str>) -> EnvCheck {
+/// 按设置 override（优先）与 PATH/GUI 常见目录探测 dsh 与 node，并校验 node 版本。
+pub fn detect_environment(path_env: Option<&str>, overrides: &EnvOverrides) -> EnvCheck {
     let fallbacks: Vec<PathBuf> = EXTRA_BIN_DIRS.iter().map(PathBuf::from).collect();
-    detect_environment_with_dirs(path_env, &fallbacks)
+    detect_environment_with_dirs(path_env, &fallbacks, overrides)
 }
 
 /// [`detect_environment`] 的可注入版本：`extra_dirs` 替代 GUI 常见目录，供测试使用。
-pub fn detect_environment_with_dirs(path_env: Option<&str>, extra_dirs: &[PathBuf]) -> EnvCheck {
+///
+/// override 指定了路径但不可执行时，视为对应组件缺失（把选择权交回用户修正）。
+pub fn detect_environment_with_dirs(
+    path_env: Option<&str>,
+    extra_dirs: &[PathBuf],
+    overrides: &EnvOverrides,
+) -> EnvCheck {
     let mut dirs = path_env.map(dirs_from_path).unwrap_or_default();
     dirs.extend_from_slice(extra_dirs);
-    let Some(dsh_path) = find_executable("dsh", &dirs) else {
+    let dsh_path = match &overrides.dsh {
+        Some(path) if is_executable_path(path) => Some(path.clone()),
+        Some(_) => None,
+        None => find_executable("dsh", &dirs),
+    };
+    let Some(dsh_path) = dsh_path else {
         return EnvCheck::MissingDsh;
     };
-    let node_probe = find_executable("node", &dirs)
+    let node_path = match &overrides.node {
+        Some(path) if is_executable_path(path) => Some(path.clone()),
+        Some(_) => None,
+        None => find_executable("node", &dirs),
+    };
+    let node_probe = node_path
         .and_then(|node| run_and_capture_output(&node, &["--version"]).map(|out| (node, out)));
     let Some((node_path, version_output)) = node_probe else {
         return EnvCheck::MissingNode;
@@ -634,7 +672,7 @@ mod tests {
         dir.executable("dsh");
         fake_node(&dir, "v22.11.0");
         let extra = vec![dir.path()];
-        match detect_environment_with_dirs(Some(""),&extra) {
+        match detect_environment_with_dirs(Some(""), &extra, &EnvOverrides::default()) {
             EnvCheck::Ok(env) => {
                 assert_eq!(env.dsh_path, dir.path().join("dsh"));
                 assert_eq!(env.node_path, dir.path().join("node"));
@@ -648,7 +686,7 @@ mod tests {
     fn detect_environment_missing_dsh_when_nothing_found() {
         let dir = TempDir::new("env-empty");
         assert!(matches!(
-            detect_environment_with_dirs(Some(""),&[dir.path()]),
+            detect_environment_with_dirs(Some(""), &[dir.path()], &EnvOverrides::default()),
             EnvCheck::MissingDsh
         ));
     }
@@ -658,7 +696,7 @@ mod tests {
         let dir = TempDir::new("env-nonode");
         dir.executable("dsh");
         assert!(matches!(
-            detect_environment_with_dirs(Some(""),&[dir.path()]),
+            detect_environment_with_dirs(Some(""), &[dir.path()], &EnvOverrides::default()),
             EnvCheck::MissingNode
         ));
     }
@@ -669,7 +707,7 @@ mod tests {
         dir.executable("dsh");
         fake_node(&dir, "v18.20.0");
         assert!(matches!(
-            detect_environment_with_dirs(Some(""),&[dir.path()]),
+            detect_environment_with_dirs(Some(""), &[dir.path()], &EnvOverrides::default()),
             EnvCheck::NodeTooOld { major: 18 }
         ));
     }
@@ -680,7 +718,7 @@ mod tests {
         dir.executable("dsh");
         fake_node(&dir, "garbage output");
         assert!(matches!(
-            detect_environment_with_dirs(Some(""),&[dir.path()]),
+            detect_environment_with_dirs(Some(""), &[dir.path()], &EnvOverrides::default()),
             EnvCheck::MissingNode
         ));
     }
@@ -689,8 +727,57 @@ mod tests {
     fn detect_environment_real_machine_has_compatible_node_if_present() {
         // 宽松冒烟：本机若能找到 node，其版本必须满足 dsh 要求。
         if find_executable("node", &search_dirs(None)).is_some() {
-            assert!(matches!(detect_environment(None), EnvCheck::Ok(_)));
+            assert!(matches!(detect_environment(None, &EnvOverrides::default()), EnvCheck::Ok(_)));
         }
+    }
+
+    #[test]
+    fn overrides_take_precedence_over_search_dirs() {
+        let auto_dir = TempDir::new("ovr-auto");
+        auto_dir.executable("dsh");
+        let manual_dir = TempDir::new("ovr-manual");
+        let dsh = manual_dir.executable("dsh");
+        let node = fake_node(&manual_dir, "v22.11.0");
+        let overrides = EnvOverrides {
+            dsh: Some(dsh.clone()),
+            node: Some(node.clone()),
+        };
+        // 搜索目录里也有 dsh，但 override 优先。
+        match detect_environment_with_dirs(Some(""), &[auto_dir.path()], &overrides) {
+            EnvCheck::Ok(env) => {
+                assert_eq!(env.dsh_path, dsh);
+                assert_eq!(env.node_path, node);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_dsh_override_reports_missing_even_when_auto_would_hit() {
+        let auto_dir = TempDir::new("ovr-bad-auto");
+        auto_dir.executable("dsh");
+        let overrides = EnvOverrides {
+            dsh: Some(auto_dir.path().join("no-such-dsh")),
+            node: None,
+        };
+        assert!(matches!(
+            detect_environment_with_dirs(Some(""), &[auto_dir.path()], &overrides),
+            EnvCheck::MissingDsh
+        ));
+    }
+
+    #[test]
+    fn invalid_node_override_reports_missing_node() {
+        let dir = TempDir::new("ovr-bad-node");
+        dir.executable("dsh");
+        let overrides = EnvOverrides {
+            dsh: None,
+            node: Some(dir.path().join("no-such-node")),
+        };
+        assert!(matches!(
+            detect_environment_with_dirs(Some(""), &[dir.path()], &overrides),
+            EnvCheck::MissingNode
+        ));
     }
 
     #[test]
