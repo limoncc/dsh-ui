@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::webview::WebviewBuilder;
 use tauri::window::WindowBuilder;
-use tauri::{Emitter, Listener, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl};
+use tauri::{Emitter, Listener, Manager, State, WebviewUrl};
 
 /// 底部状态条高度（逻辑像素）。
 const BAR_HEIGHT: f64 = 36.0;
@@ -548,32 +548,36 @@ fn start_dsh(app: &tauri::AppHandle) {
 
 /// 按 `terminal_open` 状态重排主窗口的 content / bar 两个 webview。
 /// bar 总高 = 按钮条(36) + 终端面板（展开时 320，收起时 0）。
+/// 注意：全部用**逻辑坐标**——`set_bounds` 对 Physical 变体的处理与
+/// `add_child` 不一致（实测物理值会被再除一次 scale，导致高度减半、
+/// 点击命中区域错位），逻辑值由 tauri 内部换算，行为与初始 add_child 一致。
 fn relayout(app: &tauri::AppHandle) {
     let Some(window) = app.get_window("main") else {
+        return;
+    };
+    let Ok(scale) = window.scale_factor() else {
         return;
     };
     let Ok(inner) = window.inner_size() else {
         return;
     };
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let bar_height = BAR_HEIGHT * scale;
+    let inner_logical = inner.to_logical::<f64>(scale);
     let term_height = if app.state::<AppState>().terminal_open.load(Ordering::Relaxed) {
-        TERMINAL_HEIGHT * scale
+        TERMINAL_HEIGHT
     } else {
         0.0
     };
-    let width = f64::from(inner.width);
-    let content_height = (f64::from(inner.height) - bar_height - term_height).max(0.0);
+    let content_height = (inner_logical.height - BAR_HEIGHT - term_height).max(0.0);
     if let Some(content) = app.get_webview("content") {
         let _ = content.set_bounds(tauri::Rect {
-            position: tauri::PhysicalPosition::new(0.0, 0.0).into(),
-            size: tauri::PhysicalSize::new(width, content_height).into(),
+            position: tauri::LogicalPosition::new(0.0, 0.0).into(),
+            size: tauri::LogicalSize::new(inner_logical.width, content_height).into(),
         });
     }
     if let Some(bar) = app.get_webview("bar") {
         let _ = bar.set_bounds(tauri::Rect {
-            position: tauri::PhysicalPosition::new(0.0, content_height).into(),
-            size: tauri::PhysicalSize::new(width, bar_height + term_height).into(),
+            position: tauri::LogicalPosition::new(0.0, content_height).into(),
+            size: tauri::LogicalSize::new(inner_logical.width, BAR_HEIGHT + term_height).into(),
         });
     }
 }
@@ -594,12 +598,12 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
         .title_bar_style(tauri::TitleBarStyle::Transparent);
     let window = window.build()?;
 
-    // 初始布局以物理像素统一计算；此后窗口变化由 relayout 重排。
+    // 初始布局与 relayout 保持同一坐标系（逻辑像素）。
     let inner = window.inner_size()?;
     let scale = window.scale_factor().unwrap_or(1.0);
-    let bar_height = BAR_HEIGHT * scale;
-    let content_height = (inner.height as f64 - bar_height).max(0.0);
-    let width = inner.width as f64;
+    let inner_logical = inner.to_logical::<f64>(scale);
+    let content_height = (inner_logical.height - BAR_HEIGHT).max(0.0);
+    let width = inner_logical.width;
 
     // content：导航锁定——只放行壳页面与当前 dsh 端口，其余转系统浏览器。
     let app_handle = app.handle().clone();
@@ -617,15 +621,15 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
         });
     window.add_child(
         content,
-        PhysicalPosition::new(0.0, 0.0),
-        PhysicalSize::new(width, content_height),
+        tauri::LogicalPosition::new(0.0, 0.0),
+        tauri::LogicalSize::new(width, content_height),
     )?;
 
     let bar = WebviewBuilder::new("bar", WebviewUrl::App("bar.html".into()));
     window.add_child(
         bar,
-        PhysicalPosition::new(0.0, content_height),
-        PhysicalSize::new(width, bar_height),
+        tauri::LogicalPosition::new(0.0, content_height),
+        tauri::LogicalSize::new(width, BAR_HEIGHT),
     )?;
     Ok(())
 }
