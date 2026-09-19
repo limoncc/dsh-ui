@@ -8,8 +8,7 @@
   ],
   "webviews": [
     "content",
-    "settings",
-    "terminal"
+    "settings"
   ],
   "permissions": [
     "core:default",

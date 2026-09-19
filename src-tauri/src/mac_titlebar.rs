@@ -2,7 +2,7 @@
 //! 从左到右依次为 状态 / 日志 / 设置 / 终端 四个原生按钮。
 //! 状态按钮点击 = 重启 dsh；其余按钮直调对应 Rust 函数，不经过 webview IPC。
 
-use super::{open_settings_window, restart_dsh_impl, toggle_terminal_impl};
+use super::{open_settings_window, restart_dsh_impl};
 use tauri::Manager;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, Sel};
@@ -58,13 +58,6 @@ define_class!(
         fn settings_clicked(&self, _sender: &AnyObject) {
             if let Some(app) = APP_HANDLE.get() {
                 let _ = open_settings_window(app);
-            }
-        }
-
-        #[unsafe(method(terminalClicked:))]
-        fn terminal_clicked(&self, _sender: &AnyObject) {
-            if let Some(app) = APP_HANDLE.get() {
-                let _ = toggle_terminal_impl(app);
             }
         }
     }
@@ -186,12 +179,10 @@ pub fn rebuild(window: &tauri::Window) -> tauri::Result<()> {
         unsafe { make_button(mtm, target_obj, sel!(logsClicked:), "日志") };
     let settings_btn =
         unsafe { make_button(mtm, target_obj, sel!(settingsClicked:), "设置") };
-    let terminal_btn =
-        unsafe { make_button(mtm, target_obj, sel!(terminalClicked:), "终端") };
 
     // 统一高度、垂直居中，从左到右排布，整体贴标题栏右缘。
     let y = (CONTAINER_H - CONTROL_H) / 2.0;
-    let widths: Vec<f64> = [&status_btn, &logs_btn, &settings_btn, &terminal_btn]
+    let widths: Vec<f64> = [&status_btn, &logs_btn, &settings_btn]
         .iter()
         .map(|b| b.frame().size.width)
         .collect();
@@ -204,9 +195,7 @@ pub fn rebuild(window: &tauri::Window) -> tauri::Result<()> {
     container.setFrameOrigin(NSPoint::new(0.0, 0.0));
 
     let mut x = 0.0;
-    for (idx, button) in [&status_btn, &logs_btn, &settings_btn, &terminal_btn]
-        .into_iter()
-        .enumerate()
+    for (idx, button) in [&status_btn, &logs_btn, &settings_btn].into_iter().enumerate()
     {
         button.setFrameSize(NSSize::new(widths[idx], CONTROL_H));
         button.setFrameOrigin(NSPoint::new(x, y));

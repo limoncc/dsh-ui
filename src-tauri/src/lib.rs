@@ -1,20 +1,16 @@
 #[cfg(target_os = "macos")]
 pub mod mac_titlebar;
 pub mod dsh;
-pub mod pty;
 pub mod settings;
 
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::webview::WebviewBuilder;
 use tauri::window::WindowBuilder;
 use tauri::{Emitter, Listener, Manager, State, WebviewUrl};
-
-/// 内嵌终端面板高度（逻辑像素）。
-const TERMINAL_HEIGHT: f64 = 320.0;
 
 /// 注入 dsh 页面：检测网页明暗主题。
 ///
@@ -114,57 +110,6 @@ mod dsh_state_tests {
     }
 }
 
-/// PTY 输出共享缓冲：`data` 存自 `base` 起的累计字节，超出上限裁掉最旧段。
-#[derive(Default)]
-struct PtyOutput {
-    inner: Mutex<OutBuf>,
-    cond: std::sync::Condvar,
-}
-
-#[derive(Default)]
-struct OutBuf {
-    data: Vec<u8>,
-    base: u64,
-}
-
-impl PtyOutput {
-    const CAP: usize = 512 * 1024;
-
-    fn push(&self, bytes: &[u8]) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.data.extend_from_slice(bytes);
-        let overflow = guard.data.len().saturating_sub(Self::CAP);
-        if overflow > 0 {
-            guard.data.drain(..overflow);
-            guard.base += overflow as u64;
-        }
-        drop(guard);
-        self.cond.notify_all();
-    }
-
-    /// 读取 `offset` 之后的数据；`timeout` 内无新数据则返回空。
-    fn read_from(&self, offset: u64, timeout: Duration) -> (u64, Vec<u8>) {
-        let deadline = Instant::now() + timeout;
-        let mut guard = self.inner.lock().unwrap();
-        loop {
-            let end = guard.base + guard.data.len() as u64;
-            if offset < end {
-                let start = (offset.saturating_sub(guard.base)) as usize;
-                return (offset + (guard.data.len() - start) as u64, guard.data[start..].to_vec());
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return (offset, Vec::new());
-            }
-            let (g, _timeout) = self
-                .cond
-                .wait_timeout(guard, remaining.min(Duration::from_millis(50)))
-                .unwrap();
-            guard = g;
-        }
-    }
-}
-
 struct AppState {
     process: Mutex<Option<dsh::DshProcess>>,
     state: Mutex<DshState>,
@@ -172,16 +117,6 @@ struct AppState {
     dsh_port: Mutex<Option<u16>>,
     /// content webview 当前缩放（百分比）。
     zoom: AtomicU32,
-    /// 内嵌终端的 PTY 会话（首次展开时创建）。
-    pty: Mutex<Option<pty::PtySession>>,
-    /// 前端 xterm 实际行列（fit 后上报），spawn 时用，避免二次 resize 重绘。
-    terminal_size_hint: Mutex<Option<(u16, u16)>>,
-    /// 内嵌终端面板是否展开。
-    terminal_open: std::sync::atomic::AtomicBool,
-    /// 内嵌终端面板高度（逻辑像素，可拖拽调整）。
-    terminal_height: std::sync::atomic::AtomicU32,
-    /// PTY 输出环形缓冲：前端按 offset 拉取（可靠通道，不走事件）。
-    pty_out: Arc<PtyOutput>,
     /// 当前主题（"light"/"dark"），供壳页面轮询。
     theme: Mutex<String>,
 }
@@ -303,126 +238,6 @@ fn open_log_dir() {
     open_log_dir_impl();
 }
 
-/// 首次展开终端时创建 PTY 会话，输出 base64 后经事件推给前端。
-fn spawn_pty(app: &tauri::AppHandle) -> Result<(), String> {
-    if app.state::<AppState>().pty.lock().unwrap().is_some() {
-        return Ok(());
-    }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-    let pty_out = app.state::<AppState>().pty_out.clone();
-    let exit_handle = app.clone();
-    let hint = *app.state::<AppState>().terminal_size_hint.lock().unwrap();
-    let (rows, cols) = hint.unwrap_or((20, 120));
-    let session = pty::PtySession::spawn(
-        pty::PtyConfig {
-            shell: shell.into(),
-            args: vec![],
-            cwd: cwd.into(),
-            rows,
-            cols,
-            extra_env: vec![("TERM".to_string(), "xterm-256color".to_string())],
-        },
-        Arc::new(move |bytes| {
-            pty_out.push(&bytes);
-        }),
-        Box::new(move |_code| {
-            // shell 退出后清掉会话：下次展开面板自动重启新 shell。
-            *exit_handle.state::<AppState>().pty.lock().unwrap() = None;
-            let _ = exit_handle.emit("pty://exit", ());
-        }),
-    )
-    .map_err(|error| error.to_string())?;
-    *app.state::<AppState>().pty.lock().unwrap() = Some(session);
-    Ok(())
-}
-
-/// 开/关独立终端窗口（贴主窗口正下方），返回开启后的状态。
-pub(crate) fn toggle_terminal_impl(app: &tauri::AppHandle) -> Result<bool, String> {
-    let state = app.state::<AppState>();
-    let open = !state.terminal_open.load(Ordering::Relaxed);
-    state.terminal_open.store(open, Ordering::Relaxed);
-    if open {
-        spawn_pty(app)?;
-    }
-    relayout(app);
-    Ok(open)
-}
-
-/// Tauri 命令：开合内嵌终端面板（terminal.html 轮询触发自身初始化）。
-#[tauri::command]
-fn terminal_toggle(app: tauri::AppHandle) -> Result<bool, String> {
-    toggle_terminal_impl(&app)
-}
-
-/// Tauri 命令：向内嵌终端写入键盘输入。
-#[tauri::command]
-fn pty_write(state: tauri::State<'_, AppState>, data: String) -> Result<(), String> {
-    let guard = state.pty.lock().unwrap();
-    match guard.as_ref() {
-        Some(session) => session.write(data.as_bytes()).map_err(|error| error.to_string()),
-        None => Ok(()),
-    }
-}
-
-/// Tauri 命令：终端面板当前高度。
-#[tauri::command]
-fn get_terminal_height(state: tauri::State<'_, AppState>) -> u32 {
-    state.terminal_height.load(Ordering::Relaxed)
-}
-
-/// Tauri 命令：设置终端面板高度（拖拽把手调用），返回实际生效高度。
-#[tauri::command]
-fn set_terminal_height(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    height: f64,
-) -> u32 {
-    let h = height.round().clamp(120.0, 2000.0) as u32;
-    state.terminal_height.store(h, Ordering::Relaxed);
-    relayout(&app);
-    h
-}
-
-/// Tauri 命令：前端 xterm fit 后上报行列，供 spawn 时直接使用正确尺寸。
-#[tauri::command]
-fn set_terminal_size_hint(
-    state: tauri::State<'_, AppState>,
-    rows: u16,
-    cols: u16,
-) {
-    *state.terminal_size_hint.lock().unwrap() = Some((rows, cols));
-}
-
-/// Tauri 命令：同步终端尺寸（前端 fit 后调用）。
-#[tauri::command]
-fn pty_resize(state: tauri::State<'_, AppState>, rows: u16, cols: u16) -> Result<(), String> {
-    let guard = state.pty.lock().unwrap();
-    match guard.as_ref() {
-        Some(session) => session.resize(rows, cols).map_err(|error| error.to_string()),
-        None => Ok(()),
-    }
-}
-
-/// pty_read 的返回：新输出（base64）+ 新游标 + shell 是否已退出。
-#[derive(serde::Serialize)]
-struct PtyRead {
-    cursor: u64,
-    data: String,
-    exited: bool,
-}
-
-/// Tauri 命令：拉取 PTY 输出（长轮询：最多等 150ms）。
-#[tauri::command]
-fn pty_read(state: tauri::State<'_, AppState>, cursor: u64) -> Result<PtyRead, String> {
-    let (next, bytes) = state.pty_out.read_from(cursor, Duration::from_millis(150));
-    use base64::Engine;
-    Ok(PtyRead {
-        cursor: next,
-        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
-        exited: state.pty.lock().unwrap().is_none(),
-    })
-}
 
 /// 让 macOS 窗口原生外观（材质与 NSAppearance）跟随 dsh 页面主题，
 /// 并广播给 bar/loading 页面切换配色。必须在主线程调用。
@@ -686,8 +501,7 @@ fn start_dsh(app: &tauri::AppHandle) {
     }
 }
 
-/// 按终端开合状态重排：展开时终端面板贴底（320）、content 上缩；
-/// 收起时终端隐藏、content 铺满。隐藏的 webview 仍保持加载与运行。
+/// 窗口尺寸变化时让 content webview 铺满主窗口（逻辑坐标）。
 fn relayout(app: &tauri::AppHandle) {
     let Some(window) = app.get_window("main") else {
         return;
@@ -699,19 +513,10 @@ fn relayout(app: &tauri::AppHandle) {
         return;
     };
     let inner_logical = inner.to_logical::<f64>(scale);
-    let open = app.state::<AppState>().terminal_open.load(Ordering::Relaxed);
-    let term_height = if open { TERMINAL_HEIGHT } else { 0.0 };
-    let content_height = (inner_logical.height - term_height).max(0.0);
     if let Some(content) = app.get_webview("content") {
         let _ = content.set_bounds(tauri::Rect {
             position: tauri::LogicalPosition::new(0.0, 0.0).into(),
-            size: tauri::LogicalSize::new(inner_logical.width, content_height).into(),
-        });
-    }
-    if let Some(terminal) = app.get_webview("terminal") {
-        let _ = terminal.set_bounds(tauri::Rect {
-            position: tauri::LogicalPosition::new(0.0, content_height).into(),
-            size: tauri::LogicalSize::new(inner_logical.width, term_height).into(),
+            size: tauri::LogicalSize::new(inner_logical.width, inner_logical.height).into(),
         });
     }
 }
@@ -783,13 +588,6 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry
         tauri::LogicalSize::new(width, content_height),
     )?;
 
-    // 内嵌终端面板：常驻 webview（320 高），由 relayout 控制显隐与布局。
-    let terminal = WebviewBuilder::new("terminal", WebviewUrl::App("terminal.html".into()));
-    window.add_child(
-        terminal,
-        tauri::LogicalPosition::new(0.0, content_height),
-        tauri::LogicalSize::new(width, TERMINAL_HEIGHT),
-    )?;
     Ok(window)
 }
 
@@ -929,11 +727,6 @@ pub fn run() {
             state: Mutex::new(DshState::default()),
             dsh_port: Mutex::new(None),
             zoom: AtomicU32::new(100),
-            pty: Mutex::new(None),
-            terminal_size_hint: Mutex::new(None),
-            terminal_open: std::sync::atomic::AtomicBool::new(false),
-            terminal_height: std::sync::atomic::AtomicU32::new(320),
-            pty_out: Arc::new(PtyOutput::default()),
             theme: Mutex::new("light".to_string()),
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -964,13 +757,6 @@ pub fn run() {
             open_settings,
             test_environment,
             get_theme,
-            set_terminal_size_hint,
-            terminal_toggle,
-            pty_write,
-            pty_read,
-            pty_resize,
-            get_terminal_height,
-            set_terminal_height
         ])
         .setup(|app| {
             let window = build_main_window(app)?;
