@@ -176,6 +176,8 @@ struct AppState {
     pty: Mutex<Option<pty::PtySession>>,
     /// 内嵌终端面板是否展开。
     terminal_open: std::sync::atomic::AtomicBool,
+    /// 内嵌终端面板高度（逻辑像素，可拖拽调整）。
+    terminal_height: std::sync::atomic::AtomicU32,
     /// PTY 输出环形缓冲：前端按 offset 拉取（可靠通道，不走事件）。
     pty_out: Arc<PtyOutput>,
     /// 当前主题（"light"/"dark"），供壳页面轮询。
@@ -357,6 +359,25 @@ fn pty_write(state: tauri::State<'_, AppState>, data: String) -> Result<(), Stri
         Some(session) => session.write(data.as_bytes()).map_err(|error| error.to_string()),
         None => Ok(()),
     }
+}
+
+/// Tauri 命令：终端面板当前高度。
+#[tauri::command]
+fn get_terminal_height(state: tauri::State<'_, AppState>) -> u32 {
+    state.terminal_height.load(Ordering::Relaxed)
+}
+
+/// Tauri 命令：设置终端面板高度（拖拽把手调用），返回实际生效高度。
+#[tauri::command]
+fn set_terminal_height(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    height: f64,
+) -> u32 {
+    let h = height.round().clamp(120.0, 2000.0) as u32;
+    state.terminal_height.store(h, Ordering::Relaxed);
+    relayout(&app);
+    h
 }
 
 /// Tauri 命令：同步终端尺寸（前端 fit 后调用）。
@@ -880,6 +901,7 @@ pub fn run() {
             zoom: AtomicU32::new(100),
             pty: Mutex::new(None),
             terminal_open: std::sync::atomic::AtomicBool::new(false),
+            terminal_height: std::sync::atomic::AtomicU32::new(320),
             pty_out: Arc::new(PtyOutput::default()),
             theme: Mutex::new("light".to_string()),
         })
@@ -914,7 +936,9 @@ pub fn run() {
             terminal_toggle,
             pty_write,
             pty_read,
-            pty_resize
+            pty_resize,
+            get_terminal_height,
+            set_terminal_height
         ])
         .setup(|app| {
             let window = build_main_window(app)?;

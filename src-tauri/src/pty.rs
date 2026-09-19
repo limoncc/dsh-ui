@@ -205,6 +205,7 @@ mod real_shell_tests {
                 cwd: std::env::temp_dir(),
                 rows: 24,
                 cols: 80,
+                extra_env: Vec::new(),
             },
             Arc::new(move |bytes| {
                 collected2.lock().unwrap().extend_from_slice(&bytes);

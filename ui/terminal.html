@@ -8,19 +8,40 @@
       body {
         margin: 0;
         height: 100vh;
+        display: flex;
+        flex-direction: column;
         background: #1e1e20;
       }
       #term {
-        height: 100%;
+        flex: 1;
+        min-height: 0;
         padding: 4px 8px 0;
         box-sizing: border-box;
       }
       #term .xterm {
         height: 100%;
       }
+      /* 隐藏 xterm 滚动条（右下角白点来源） */
+      .xterm-viewport::-webkit-scrollbar {
+        display: none;
+      }
+      .xterm-viewport {
+        scrollbar-width: none;
+      }
+      /* 顶部拖拽把手：上下拖动调整面板高度 */
+      #drag-handle {
+        height: 8px;
+        flex: none;
+        cursor: row-resize;
+        background: rgba(255, 255, 255, 0.06);
+      }
+      #drag-handle:hover {
+        background: rgba(10, 132, 255, 0.35);
+      }
     </style>
   </head>
   <body>
+    <div id="drag-handle" title="拖动调整高度"></div>
     <div id="term"></div>
     <script src="vendor/xterm.js"></script>
     <script src="vendor/addon-fit.js"></script>
