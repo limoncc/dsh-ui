@@ -8,7 +8,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::webview::WebviewBuilder;
 use tauri::window::WindowBuilder;
 use tauri::{Emitter, Listener, Manager, State, WebviewUrl};
@@ -114,6 +114,57 @@ mod dsh_state_tests {
     }
 }
 
+/// PTY 输出共享缓冲：`data` 存自 `base` 起的累计字节，超出上限裁掉最旧段。
+#[derive(Default)]
+struct PtyOutput {
+    inner: Mutex<OutBuf>,
+    cond: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct OutBuf {
+    data: Vec<u8>,
+    base: u64,
+}
+
+impl PtyOutput {
+    const CAP: usize = 512 * 1024;
+
+    fn push(&self, bytes: &[u8]) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.data.extend_from_slice(bytes);
+        let overflow = guard.data.len().saturating_sub(Self::CAP);
+        if overflow > 0 {
+            guard.data.drain(..overflow);
+            guard.base += overflow as u64;
+        }
+        drop(guard);
+        self.cond.notify_all();
+    }
+
+    /// 读取 `offset` 之后的数据；`timeout` 内无新数据则返回空。
+    fn read_from(&self, offset: u64, timeout: Duration) -> (u64, Vec<u8>) {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inner.lock().unwrap();
+        loop {
+            let end = guard.base + guard.data.len() as u64;
+            if offset < end {
+                let start = (offset.saturating_sub(guard.base)) as usize;
+                return (offset + (guard.data.len() - start) as u64, guard.data[start..].to_vec());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return (offset, Vec::new());
+            }
+            let (g, _timeout) = self
+                .cond
+                .wait_timeout(guard, remaining.min(Duration::from_millis(50)))
+                .unwrap();
+            guard = g;
+        }
+    }
+}
+
 struct AppState {
     process: Mutex<Option<dsh::DshProcess>>,
     state: Mutex<DshState>,
@@ -125,6 +176,8 @@ struct AppState {
     terminal_open: std::sync::atomic::AtomicBool,
     /// 内嵌终端的 PTY 会话（首次展开时创建）。
     pty: Mutex<Option<pty::PtySession>>,
+    /// PTY 输出环形缓冲：前端按 offset 拉取（可靠通道，不走事件）。
+    pty_out: Arc<PtyOutput>,
     /// 当前主题（"light"/"dark"），供壳页面轮询。
     theme: Mutex<String>,
 }
@@ -253,7 +306,7 @@ fn spawn_pty(app: &tauri::AppHandle) -> Result<(), String> {
     }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-    let output_handle = app.clone();
+    let pty_out = app.state::<AppState>().pty_out.clone();
     let exit_handle = app.clone();
     let session = pty::PtySession::spawn(
         pty::PtyConfig {
@@ -264,9 +317,7 @@ fn spawn_pty(app: &tauri::AppHandle) -> Result<(), String> {
             cols: 80,
         },
         Arc::new(move |bytes| {
-            use base64::Engine;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            let _ = output_handle.emit("pty://output", encoded);
+            pty_out.push(&bytes);
         }),
         Box::new(move |_code| {
             // shell 退出后清掉会话：下次展开面板自动重启新 shell。
@@ -321,6 +372,26 @@ fn pty_resize(state: tauri::State<'_, AppState>, rows: u16, cols: u16) -> Result
 #[tauri::command]
 fn get_terminal_open(state: tauri::State<'_, AppState>) -> bool {
     state.terminal_open.load(Ordering::Relaxed)
+}
+
+/// pty_read 的返回：新输出（base64）+ 新游标 + shell 是否已退出。
+#[derive(serde::Serialize)]
+struct PtyRead {
+    cursor: u64,
+    data: String,
+    exited: bool,
+}
+
+/// Tauri 命令：拉取 PTY 输出（长轮询：最多等 150ms）。
+#[tauri::command]
+fn pty_read(state: tauri::State<'_, AppState>, cursor: u64) -> Result<PtyRead, String> {
+    let (next, bytes) = state.pty_out.read_from(cursor, Duration::from_millis(150));
+    use base64::Engine;
+    Ok(PtyRead {
+        cursor: next,
+        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        exited: state.pty.lock().unwrap().is_none(),
+    })
 }
 
 /// 让 macOS 窗口原生外观（材质与 NSAppearance）跟随 dsh 页面主题，
@@ -818,6 +889,7 @@ pub fn run() {
             zoom: AtomicU32::new(100),
             terminal_open: std::sync::atomic::AtomicBool::new(false),
             pty: Mutex::new(None),
+            pty_out: Arc::new(PtyOutput::default()),
             theme: Mutex::new("light".to_string()),
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -850,6 +922,7 @@ pub fn run() {
             get_theme,
             terminal_toggle,
             pty_write,
+            pty_read,
             pty_resize,
             get_terminal_open
         ])

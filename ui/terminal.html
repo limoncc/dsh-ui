@@ -71,26 +71,37 @@
         return bytes;
       }
 
+      let cursor = 0;
+      let shellAlive = true;
+      let pulling = false;
+
+      async function pullOutput() {
+        // 面板收起时暂停拉取；展开后从上次游标继续（环形缓冲保留近期输出）。
+        if (!term || pulling || !(await invoke('get_terminal_open').catch(() => false))) return;
+        pulling = true;
+        try {
+          // 长轮询：Rust 侧最多等 150ms，有数据立即返回。
+          const res = await invoke('pty_read', { cursor });
+          if (res.data) term.write(base64ToBytes(res.data));
+          cursor = res.cursor;
+          if (!res.exited && !shellAlive) {
+            shellAlive = true;
+          } else if (res.exited && shellAlive) {
+            shellAlive = false;
+            term.writeln('\r\n\x1b[2m[shell 已退出，收起后再展开可重启]\x1b[0m');
+          }
+        } catch (e) {}
+        pulling = false;
+      }
+
       if (T) {
-        // PTY 输出：本地页面的 listen 可靠，直接使用。
-        if (typeof T.listen === 'function') {
-          T.listen('pty://output', (event) => {
-            if (term) term.write(base64ToBytes(event.payload));
-          });
-          T.listen('pty://exit', () => {
-            if (term) term.writeln('\r\n\x1b[2m[shell 已退出]\x1b[0m');
-          });
-        }
-        // 轮询开合状态：展开时初始化终端并适配尺寸。
-        setInterval(async () => {
-          try {
-            const open = await invoke('get_terminal_open');
-            if (open) {
-              initTerminal();
-              requestAnimationFrame(fitTerminal);
-            }
-          } catch (e) {}
-        }, 400);
+        // 输出拉取循环（可靠 IPC 通道，不走事件）。
+        (async () => {
+          for (;;) {
+            await pullOutput();
+            await new Promise((r) => setTimeout(r, 30));
+          }
+        })();
       }
     </script>
   </body>
