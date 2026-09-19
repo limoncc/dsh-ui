@@ -1,6 +1,7 @@
 #[cfg(target_os = "macos")]
 pub mod mac_titlebar;
 pub mod dsh;
+pub mod pty;
 pub mod settings;
 
 use serde::Serialize;
@@ -11,9 +12,6 @@ use std::time::Duration;
 use tauri::webview::WebviewBuilder;
 use tauri::window::WindowBuilder;
 use tauri::{Emitter, Listener, Manager, State, WebviewUrl};
-
-/// 顶部状态条高度（逻辑像素）。
-const BAR_HEIGHT: f64 = 36.0;
 
 /// 注入 dsh 页面：检测网页明暗主题。
 ///
@@ -76,6 +74,9 @@ const THEME_DETECT_SCRIPT: &str = r#"
 })();
 "#;
 
+/// 内嵌终端面板高度（逻辑像素）。
+const TERMINAL_HEIGHT: f64 = 320.0;
+
 /// dsh 启动就绪的最长等待时间；可用 `DSH_UI_BOOT_TIMEOUT` 环境变量覆盖（秒）。
 const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 30;
 
@@ -120,6 +121,10 @@ struct AppState {
     dsh_port: Mutex<Option<u16>>,
     /// content webview 当前缩放（百分比）。
     zoom: AtomicU32,
+    /// 内嵌终端面板是否展开。
+    terminal_open: std::sync::atomic::AtomicBool,
+    /// 内嵌终端的 PTY 会话（首次展开时创建）。
+    pty: Mutex<Option<pty::PtySession>>,
     /// 当前主题（"light"/"dark"），供壳页面轮询。
     theme: Mutex<String>,
 }
@@ -239,6 +244,81 @@ pub(crate) fn open_log_dir_impl() {
 #[tauri::command]
 fn open_log_dir() {
     open_log_dir_impl();
+}
+
+/// 首次展开终端时创建 PTY 会话，输出 base64 后经事件推给前端。
+fn spawn_pty(app: &tauri::AppHandle) -> Result<(), String> {
+    if app.state::<AppState>().pty.lock().unwrap().is_some() {
+        return Ok(());
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let output_handle = app.clone();
+    let exit_handle = app.clone();
+    let session = pty::PtySession::spawn(
+        pty::PtyConfig {
+            shell: shell.into(),
+            args: vec![],
+            cwd: cwd.into(),
+            rows: 24,
+            cols: 80,
+        },
+        Arc::new(move |bytes| {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let _ = output_handle.emit("pty://output", encoded);
+        }),
+        Box::new(move |_code| {
+            let _ = exit_handle.emit("pty://exit", ());
+        }),
+    )
+    .map_err(|error| error.to_string())?;
+    *app.state::<AppState>().pty.lock().unwrap() = Some(session);
+    Ok(())
+}
+
+/// 开合内嵌终端（标题栏按钮与命令共用），返回开合后的状态。
+pub(crate) fn toggle_terminal_impl(app: &tauri::AppHandle) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+    let open = !state.terminal_open.load(Ordering::Relaxed);
+    state.terminal_open.store(open, Ordering::Relaxed);
+    if open {
+        spawn_pty(app)?;
+    }
+    relayout(app);
+    Ok(open)
+}
+
+/// Tauri 命令：开合内嵌终端面板（terminal.html 轮询触发自身初始化）。
+#[tauri::command]
+fn terminal_toggle(app: tauri::AppHandle) -> Result<bool, String> {
+    toggle_terminal_impl(&app)
+}
+
+/// Tauri 命令：向内嵌终端写入键盘输入。
+#[tauri::command]
+fn pty_write(state: tauri::State<'_, AppState>, data: String) -> Result<(), String> {
+    let guard = state.pty.lock().unwrap();
+    match guard.as_ref() {
+        Some(session) => session.write(data.as_bytes()).map_err(|error| error.to_string()),
+        None => Ok(()),
+    }
+}
+
+/// Tauri 命令：同步终端尺寸（前端 fit 后调用）。
+#[tauri::command]
+fn pty_resize(state: tauri::State<'_, AppState>, rows: u16, cols: u16) -> Result<(), String> {
+    let guard = state.pty.lock().unwrap();
+    match guard.as_ref() {
+        Some(session) => session.resize(rows, cols).map_err(|error| error.to_string()),
+        None => Ok(()),
+    }
+}
+
+/// Tauri 命令：查询终端面板开合状态（terminal.html 轮询）。
+#[tauri::command]
+fn get_terminal_open(state: tauri::State<'_, AppState>) -> bool {
+    state.terminal_open.load(Ordering::Relaxed)
 }
 
 /// 让 macOS 窗口原生外观（材质与 NSAppearance）跟随 dsh 页面主题，
@@ -503,7 +583,8 @@ fn start_dsh(app: &tauri::AppHandle) {
     }
 }
 
-/// 窗口尺寸变化时重排 content / bar 两个 webview（逻辑坐标）。
+/// 按终端开合状态重排 content / terminal 两个 webview（逻辑坐标）。
+/// 收起时终端高度为 0（不占任何空间），content 铺满窗口。
 fn relayout(app: &tauri::AppHandle) {
     let Some(window) = app.get_window("main") else {
         return;
@@ -515,26 +596,29 @@ fn relayout(app: &tauri::AppHandle) {
         return;
     };
     let inner_logical = inner.to_logical::<f64>(scale);
-    let content_height = (inner_logical.height - BAR_HEIGHT).max(0.0);
-    // 顶部条在上（0..BAR_HEIGHT），content 在其下。
-    if let Some(bar) = app.get_webview("bar") {
-        let _ = bar.set_bounds(tauri::Rect {
-            position: tauri::LogicalPosition::new(0.0, 0.0).into(),
-            size: tauri::LogicalSize::new(inner_logical.width, BAR_HEIGHT).into(),
-        });
-    }
+    let term_height = if app.state::<AppState>().terminal_open.load(Ordering::Relaxed) {
+        TERMINAL_HEIGHT
+    } else {
+        0.0
+    };
+    let content_height = (inner_logical.height - term_height).max(0.0);
     if let Some(content) = app.get_webview("content") {
         let _ = content.set_bounds(tauri::Rect {
-            position: tauri::LogicalPosition::new(0.0, BAR_HEIGHT).into(),
+            position: tauri::LogicalPosition::new(0.0, 0.0).into(),
             size: tauri::LogicalSize::new(inner_logical.width, content_height).into(),
+        });
+    }
+    if let Some(terminal) = app.get_webview("terminal") {
+        let _ = terminal.set_bounds(tauri::Rect {
+            position: tauri::LogicalPosition::new(0.0, content_height).into(),
+            size: tauri::LogicalSize::new(inner_logical.width, term_height).into(),
         });
     }
 }
 
-/// 装配主窗口：content（dsh 页面/loading）+ bar（底部状态条）双 webview。
+/// 装配主窗口：content（dsh 页面/loading）+ terminal（内嵌终端面板）双 webview。
 ///
-/// 布局全手动（不用 auto_resize）：按钮条固定高度 + 终端面板开合无法用
-/// 等比缩放表达，窗口变化时由 [`relayout`] 重排。
+/// 布局全手动（不用 auto_resize），窗口变化与终端开合都由 [`relayout`] 重排。
 fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry>> {
     let window = WindowBuilder::new(app, "main")
         .title("dsh-ui")
@@ -583,112 +667,15 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry
         tauri::LogicalPosition::new(0.0, 0.0),
         tauri::LogicalSize::new(width, content_height),
     )?;
+
+    // 内嵌终端面板：常驻 webview，初始高度 0（收起），由标题栏按钮开合。
+    let terminal = WebviewBuilder::new("terminal", WebviewUrl::App("terminal.html".into()));
+    window.add_child(
+        terminal,
+        tauri::LogicalPosition::new(0.0, content_height),
+        tauri::LogicalSize::new(width, 0.0),
+    )?;
     Ok(window)
-}
-
-/// 屏幕上的矩形（物理像素，左上原点）。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Rect {
-    pub x: f64,
-    pub y: f64,
-    pub w: f64,
-    pub h: f64,
-}
-
-/// 计算终端窗口的目标位置：与主窗口同宽、正下方留 `gap` 间距，
-/// 高度取 `max_height` 与屏幕底部余量的较小者（至少 `min_height`），
-/// 整体不越出屏幕。
-pub fn terminal_bounds(
-    window: Rect,
-    screen: Rect,
-    gap: f64,
-    max_height: f64,
-    min_height: f64,
-) -> Rect {
-    let desired_y = window.y + window.h + gap;
-    let screen_bottom = screen.y + screen.h;
-    let height = max_height.min((screen_bottom - desired_y).max(min_height));
-    let y = desired_y.min(screen_bottom - height);
-    let width = window.w.min(screen.w);
-    let x = window.x.clamp(screen.x, screen.x + screen.w - width);
-    Rect { x, y, w: width, h: height }
-}
-
-#[cfg(test)]
-mod terminal_bounds_tests {
-    use super::{terminal_bounds, Rect};
-
-    const SCREEN: Rect = Rect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 };
-
-    #[test]
-    fn terminal_sits_below_window_with_max_height_when_space_allows() {
-        let window = Rect { x: 100.0, y: 50.0, w: 1200.0, h: 300.0 };
-        let bounds = terminal_bounds(window, SCREEN, 8.0, 480.0, 120.0);
-        assert_eq!(
-            bounds,
-            Rect { x: 100.0, y: 358.0, w: 1200.0, h: 480.0 },
-            "应正对窗口下方、留 8px 间距；余量 542 > 480，高度取上限"
-        );
-    }
-
-    #[test]
-    fn terminal_keeps_min_height_when_window_touches_screen_bottom() {
-        let window = Rect { x: 0.0, y: 0.0, w: 1200.0, h: 900.0 };
-        let bounds = terminal_bounds(window, SCREEN, 8.0, 480.0, 120.0);
-        assert_eq!(bounds.h, 120.0, "无空间时保持最小高度");
-        assert_eq!(bounds.y, 780.0, "y 收进屏幕底边");
-    }
-}
-
-/// 在主窗口正下方打开 Terminal.app 新窗口。
-fn open_terminal_window(app: &tauri::AppHandle) {
-    let Some(window) = app.get_window("main") else {
-        return;
-    };
-    let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) else {
-        return;
-    };
-    let window_rect = Rect {
-        x: f64::from(position.x),
-        y: f64::from(position.y),
-        w: f64::from(size.width),
-        h: f64::from(size.height),
-    };
-    let screen_rect = window
-        .current_monitor()
-        .ok()
-        .flatten()
-        .map(|monitor| Rect {
-            x: f64::from(monitor.position().x),
-            y: f64::from(monitor.position().y),
-            w: f64::from(monitor.size().width),
-            h: f64::from(monitor.size().height),
-        })
-        .unwrap_or(window_rect);
-    let bounds = terminal_bounds(window_rect, screen_rect, 8.0, 480.0, 120.0);
-
-    // AppleScript bounds 为 {left, top, right, bottom}（顶部原点，与 Tauri 一致）。
-    let script = format!(
-        "tell application \"Terminal\"\n\
-         \x20 activate\n\
-         \x20 do script \"\"\n\
-         \x20 set bounds of front window to {{{x}, {y}, {right}, {bottom}}}\n\
-         end tell",
-        x = bounds.x as i32,
-        y = bounds.y as i32,
-        right = (bounds.x + bounds.w) as i32,
-        bottom = (bounds.y + bounds.h) as i32,
-    );
-    match std::process::Command::new("/usr/bin/osascript").arg("-e").arg(&script).output() {
-        Ok(output) if !output.status.success() => {
-            eprintln!(
-                "open_terminal: osascript 失败: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Err(error) => eprintln!("open_terminal: 无法启动 osascript: {error}"),
-        _ => {}
-    }
 }
 
 /// 缩放档位（百分比），Safari 风格；Cmd+=/-/0 与预设菜单共用。
@@ -827,6 +814,8 @@ pub fn run() {
             state: Mutex::new(DshState::default()),
             dsh_port: Mutex::new(None),
             zoom: AtomicU32::new(100),
+            terminal_open: std::sync::atomic::AtomicBool::new(false),
+            pty: Mutex::new(None),
             theme: Mutex::new("light".to_string()),
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -856,7 +845,11 @@ pub fn run() {
             save_config,
             open_settings,
             test_environment,
-            get_theme
+            get_theme,
+            terminal_toggle,
+            pty_write,
+            pty_resize,
+            get_terminal_open
         ])
         .setup(|app| {
             let window = build_main_window(app)?;
@@ -895,10 +888,10 @@ pub fn run() {
                     let state = poll_handle.state::<AppState>();
                     let snapshot = state.state.lock().unwrap().clone();
                     let title = match snapshot.status.as_str() {
-                        "ready" => "🟢 已连接",
-                        "stopped" => "🔴 dsh 已停止",
-                        "error" => "🔴 启动失败",
-                        _ => "🟡 启动中",
+                        "ready" => "● 已连接",
+                        "stopped" => "● dsh 已停止",
+                        "error" => "● 启动失败",
+                        _ => "● 启动中",
                     };
                     mac_titlebar::update_status_on_main(&poll_handle, title.to_string());
                 });

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>dsh-ui 终端</title>
+    <link rel="stylesheet" href="vendor/xterm.css" />
+    <style>
+      body {
+        margin: 0;
+        height: 100vh;
+        background: #1e1e20;
+      }
+      #term {
+        height: 100%;
+        padding: 4px 8px 0;
+        box-sizing: border-box;
+      }
+      #term .xterm {
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="term"></div>
+    <script src="vendor/xterm.js"></script>
+    <script src="vendor/addon-fit.js"></script>
+    <script>
+      const T = window.__TAURI_INTERNALS__;
+      const invoke = (cmd, args) => T.invoke(cmd, args);
+
+      let term = null;
+      let fitAddon = null;
+
+      function fitTerminal() {
+        if (!fitAddon) return;
+        try {
+          fitAddon.fit();
+        } catch (e) {}
+      }
+
+      function initTerminal() {
+        if (term) return;
+        term = new Terminal({
+          fontFamily: 'Menlo, Monaco, monospace',
+          fontSize: 12,
+          cursorBlink: true,
+          theme: {
+            background: '#1e1e20',
+            foreground: '#e8e8ea',
+            cursor: '#e8e8ea',
+            selectionBackground: 'rgba(10, 132, 255, 0.4)',
+          },
+          scrollback: 5000,
+        });
+        fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(document.getElementById('term'));
+        term.onData((data) => invoke('pty_write', { data }).catch(() => {}));
+        term.onResize(({ rows, cols }) =>
+          invoke('pty_resize', { rows, cols }).catch(() => {})
+        );
+        // 布局生效后再适配尺寸；窗口变化时同样重新 fit。
+        requestAnimationFrame(fitTerminal);
+        window.addEventListener('resize', fitTerminal);
+      }
+
+      function base64ToBytes(encoded) {
+        const binary = atob(encoded);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      }
+
+      if (T) {
+        // PTY 输出：本地页面的 listen 可靠，直接使用。
+        if (typeof T.listen === 'function') {
+          T.listen('pty://output', (event) => {
+            if (term) term.write(base64ToBytes(event.payload));
+          });
+          T.listen('pty://exit', () => {
+            if (term) term.writeln('\r\n\x1b[2m[shell 已退出]\x1b[0m');
+          });
+        }
+        // 轮询开合状态：展开时初始化终端并适配尺寸。
+        setInterval(async () => {
+          try {
+            const open = await invoke('get_terminal_open');
+            if (open) {
+              initTerminal();
+              requestAnimationFrame(fitTerminal);
+            }
+          } catch (e) {}
+        }, 400);
+      }
+    </script>
+  </body>
+</html>

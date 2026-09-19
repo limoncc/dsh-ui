@@ -2,11 +2,11 @@
 //! 从左到右依次为 状态 / 日志 / 设置 / 终端 四个原生按钮。
 //! 状态按钮点击 = 重启 dsh；其余按钮直调对应 Rust 函数，不经过 webview IPC。
 
-use super::{open_settings_window, open_terminal_window, restart_dsh_impl};
+use super::{open_settings_window, restart_dsh_impl, toggle_terminal_impl};
 use tauri::Manager;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, Sel};
-use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
+use objc2::{class, define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{NSButton, NSLayoutAttribute, NSTitlebarAccessoryViewController, NSView};
 use objc2_foundation::{NSPoint, NSSize, NSObject as FoundationNSObject, NSObjectProtocol};
 
@@ -65,7 +65,7 @@ define_class!(
         #[unsafe(method(terminalClicked:))]
         fn terminal_clicked(&self, _sender: &AnyObject) {
             if let Some(app) = APP_HANDLE.get() {
-                open_terminal_window(app);
+                let _ = toggle_terminal_impl(app);
             }
         }
     }
@@ -130,7 +130,7 @@ pub fn rebuild(window: &tauri::Window) -> tauri::Result<()> {
 
     // 从左到右：状态 / 日志 / 设置 / 终端。
     let status_btn = unsafe {
-        make_button(mtm, target_obj, sel!(statusClicked:), "🟡 启动中")
+        make_button(mtm, target_obj, sel!(statusClicked:), "● 启动中")
     };
     let logs_btn =
         unsafe { make_button(mtm, target_obj, sel!(logsClicked:), "日志") };
@@ -145,7 +145,9 @@ pub fn rebuild(window: &tauri::Window) -> tauri::Result<()> {
         .iter()
         .map(|b| b.frame().size.width)
         .collect();
-    let total_w: f64 = widths.iter().sum::<f64>() + GAP * (widths.len() - 1) as f64;
+    // 右缘留 16px，避免终端按钮被窗口圆角裁切。
+    let edge_margin: f64 = 16.0;
+    let total_w: f64 = widths.iter().sum::<f64>() + GAP * (widths.len() - 1) as f64 + edge_margin;
 
     let container = NSView::new(mtm);
     container.setFrameSize(NSSize::new(total_w, CONTAINER_H));
@@ -160,6 +162,15 @@ pub fn rebuild(window: &tauri::Window) -> tauri::Result<()> {
         button.setFrameOrigin(NSPoint::new(x, y));
         container.addSubview(button);
         x += widths[idx] + GAP;
+    }
+    // 状态按钮字号调小，指示点更精致。
+    // 状态按钮字号调小，指示点更精致。
+    unsafe {
+        let small_font: *mut AnyObject = msg_send![
+            class!(NSFont),
+            systemFontOfSize: 11.0_f64
+        ];
+        let _: () = msg_send![&*status_btn, setFont: small_font];
     }
 
     *CONTROLS.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap() = Some(Controls {
