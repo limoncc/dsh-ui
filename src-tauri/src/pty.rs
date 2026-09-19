@@ -17,6 +17,8 @@ pub struct PtyConfig {
     pub cwd: PathBuf,
     pub rows: u16,
     pub cols: u16,
+    /// 附加环境变量（如 TERM=xterm-256color）。
+    pub extra_env: Vec<(String, String)>,
 }
 
 /// 一个存活的 PTY 会话句柄。
@@ -49,6 +51,9 @@ impl PtySession {
         let mut command = CommandBuilder::new(&config.shell);
         command.args(&config.args);
         command.cwd(&config.cwd);
+        for (key, value) in &config.extra_env {
+            command.env(key, value);
+        }
         let child = pair.slave.spawn_command(command).map_err(io_err)?;
         let killer = child.clone_killer();
         let mut reader = pair.master.try_clone_reader().map_err(io_err)?;
@@ -118,6 +123,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             rows: 24,
             cols: 80,
+            extra_env: Vec::new(),
         }
     }
 

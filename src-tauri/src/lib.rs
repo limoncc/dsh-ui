@@ -310,6 +310,7 @@ fn spawn_pty(app: &tauri::AppHandle) -> Result<(), String> {
             cwd: cwd.into(),
             rows: 24,
             cols: 80,
+            extra_env: vec![("TERM".to_string(), "xterm-256color".to_string())],
         },
         Arc::new(move |bytes| {
             pty_out.push(&bytes);
