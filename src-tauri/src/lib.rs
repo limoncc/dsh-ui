@@ -174,6 +174,8 @@ struct AppState {
     zoom: AtomicU32,
     /// 内嵌终端的 PTY 会话（首次展开时创建）。
     pty: Mutex<Option<pty::PtySession>>,
+    /// 前端 xterm 实际行列（fit 后上报），spawn 时用，避免二次 resize 重绘。
+    terminal_size_hint: Mutex<Option<(u16, u16)>>,
     /// 内嵌终端面板是否展开。
     terminal_open: std::sync::atomic::AtomicBool,
     /// 内嵌终端面板高度（逻辑像素，可拖拽调整）。
@@ -310,13 +312,15 @@ fn spawn_pty(app: &tauri::AppHandle) -> Result<(), String> {
     let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     let pty_out = app.state::<AppState>().pty_out.clone();
     let exit_handle = app.clone();
+    let hint = *app.state::<AppState>().terminal_size_hint.lock().unwrap();
+    let (rows, cols) = hint.unwrap_or((20, 120));
     let session = pty::PtySession::spawn(
         pty::PtyConfig {
             shell: shell.into(),
             args: vec![],
             cwd: cwd.into(),
-            rows: 24,
-            cols: 80,
+            rows,
+            cols,
             extra_env: vec![("TERM".to_string(), "xterm-256color".to_string())],
         },
         Arc::new(move |bytes| {
@@ -378,6 +382,16 @@ fn set_terminal_height(
     state.terminal_height.store(h, Ordering::Relaxed);
     relayout(&app);
     h
+}
+
+/// Tauri 命令：前端 xterm fit 后上报行列，供 spawn 时直接使用正确尺寸。
+#[tauri::command]
+fn set_terminal_size_hint(
+    state: tauri::State<'_, AppState>,
+    rows: u16,
+    cols: u16,
+) {
+    *state.terminal_size_hint.lock().unwrap() = Some((rows, cols));
 }
 
 /// Tauri 命令：同步终端尺寸（前端 fit 后调用）。
@@ -916,6 +930,7 @@ pub fn run() {
             dsh_port: Mutex::new(None),
             zoom: AtomicU32::new(100),
             pty: Mutex::new(None),
+            terminal_size_hint: Mutex::new(None),
             terminal_open: std::sync::atomic::AtomicBool::new(false),
             terminal_height: std::sync::atomic::AtomicU32::new(320),
             pty_out: Arc::new(PtyOutput::default()),
@@ -949,6 +964,7 @@ pub fn run() {
             open_settings,
             test_environment,
             get_theme,
+            set_terminal_size_hint,
             terminal_toggle,
             pty_write,
             pty_read,

@@ -89,9 +89,15 @@
         term.loadAddon(fitAddon);
         term.open(document.getElementById('term'));
         term.onData((data) => invoke('pty_write', { data }).catch(() => {}));
-        term.onResize(({ rows, cols }) =>
-          invoke('pty_resize', { rows, cols }).catch(() => {})
-        );
+        fitTerminal();
+        if (term.rows && term.cols) {
+          invoke('set_terminal_size_hint', { rows: term.rows, cols: term.cols }).catch(() => {});
+        }
+        term.onResize(({ rows, cols }) => {
+          invoke('pty_resize', { rows, cols }).catch(() => {});
+          // 上报行列供 spawn 直接使用正确尺寸（避免打开后重绘出两份提示符）。
+          invoke('set_terminal_size_hint', { rows, cols }).catch(() => {});
+        });
         // 布局生效后再适配尺寸；窗口变化时同样重新 fit。
         requestAnimationFrame(fitTerminal);
         window.addEventListener('resize', fitTerminal);
