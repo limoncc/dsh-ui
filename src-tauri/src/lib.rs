@@ -716,6 +716,22 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry
         .title_bar_style(tauri::TitleBarStyle::Transparent);
     let window = window.build()?;
 
+    // 官方方案（v2 docs: Window Customization）：透明标题栏下窗口默认白底，
+    // webview 布局缝隙处会透白——设置深色窗口背景根治。
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::{NSColor, NSWindow};
+        let ns_window_ptr = window.ns_window().unwrap() as *mut NSWindow;
+        let ns_window = unsafe { &*ns_window_ptr };
+        let bg = NSColor::colorWithRed_green_blue_alpha(
+            30.0 / 255.0,
+            30.0 / 255.0,
+            32.0 / 255.0,
+            1.0,
+        );
+        ns_window.setBackgroundColor(Some(&bg));
+    }
+
     // 初始布局与 relayout 保持同一坐标系（逻辑像素）。
     let inner = window.inner_size()?;
     let scale = window.scale_factor().unwrap_or(1.0);

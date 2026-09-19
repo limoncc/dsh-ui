@@ -42,6 +42,18 @@
   </head>
   <body>
     <div id="drag-handle" title="滚轮或拖动调整高度，双击恢复默认"></div>
+    <div
+      id="tstat"
+      style="
+        font: 10px ui-monospace, Menlo, monospace;
+        color: #7ee787;
+        background: rgba(0, 0, 0, 0.6);
+        padding: 1px 8px;
+        z-index: 99;
+      "
+    >
+      stat: boot
+    </div>
     <div id="term"></div>
     <script src="vendor/xterm.js"></script>
     <script src="vendor/addon-fit.js"></script>
@@ -95,6 +107,12 @@
       let cursor = 0;
       let shellAlive = true;
       let pulling = false;
+      let pullCount = 0;
+      const stat = (m) => {
+        const el = document.getElementById('tstat');
+        if (el) el.textContent = m;
+      };
+      document.getElementById('tstat').textContent = 'T=' + typeof window.__TAURI_INTERNALS__;
 
       async function pullOutput() {
         // 拉取无条件运行（webview 常驻 320 高、页面加载即初始化）；
@@ -102,6 +120,10 @@
         if (!term || pulling) return;
         pulling = true;
         try {
+          pullCount += 1;
+          if (pullCount % 20 === 1) {
+            stat('pull #' + pullCount + ' cursor=' + cursor + ' h=' + (term ? term.rows : '-'));
+          }
           // 长轮询：Rust 侧最多等 150ms，有数据立即返回。
           const res = await invoke('pty_read', { cursor });
           if (res.data) term.write(base64ToBytes(res.data));
