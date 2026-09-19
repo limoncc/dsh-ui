@@ -1,10 +1,9 @@
 pub mod dsh;
-pub mod pty;
 pub mod settings;
 
 use serde::Serialize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::webview::WebviewBuilder;
@@ -13,9 +12,6 @@ use tauri::{Emitter, Listener, Manager, State, WebviewUrl};
 
 /// 底部状态条高度（逻辑像素）。
 const BAR_HEIGHT: f64 = 36.0;
-
-/// 内嵌终端面板高度（逻辑像素）。
-const TERMINAL_HEIGHT: f64 = 320.0;
 
 /// 注入 dsh 页面：检测网页明暗主题并回报给壳（移植自 deepseek_app）。
 const THEME_DETECT_SCRIPT: &str = r#"
@@ -104,10 +100,8 @@ struct AppState {
     dsh_port: Mutex<Option<u16>>,
     /// content webview 当前缩放（百分比）。
     zoom: AtomicU32,
-    /// 内嵌终端面板是否展开。
-    terminal_open: AtomicBool,
-    /// 内嵌终端的 PTY 会话（首次展开时创建）。
-    pty: Mutex<Option<pty::PtySession>>,
+    /// 当前主题（"light"/"dark"），供壳页面轮询。
+    theme: Mutex<String>,
 }
 
 /// 对 content webview 应用缩放。
@@ -200,6 +194,12 @@ fn diag_report(source: String, info: String) {
     eprintln!("[diag] {source}: {info}");
 }
 
+/// Tauri 命令：当前主题（壳页面轮询，替代不可靠的事件推送）。
+#[tauri::command]
+fn get_theme(state: State<'_, AppState>) -> String {
+    state.theme.lock().unwrap().clone()
+}
+
 /// Tauri 命令：重启 dsh（停止旧进程后重新探测并 spawn）。
 #[tauri::command]
 fn restart_dsh(app: tauri::AppHandle) {
@@ -214,70 +214,6 @@ fn restart_dsh(app: tauri::AppHandle) {
 fn open_log_dir() {
     if let Some(dir) = dsh::log_dir() {
         let _ = std::process::Command::new("open").arg("-R").arg(dir).spawn();
-    }
-}
-
-/// 首次展开终端时创建 PTY 会话，输出 base64 后经事件推给前端。
-fn spawn_pty(app: &tauri::AppHandle) -> Result<(), String> {
-    if app.state::<AppState>().pty.lock().unwrap().is_some() {
-        return Ok(());
-    }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-    let output_handle = app.clone();
-    let exit_handle = app.clone();
-    let session = pty::PtySession::spawn(
-        pty::PtyConfig {
-            shell: shell.into(),
-            args: vec![],
-            cwd: cwd.into(),
-            rows: 24,
-            cols: 80,
-        },
-        Arc::new(move |bytes| {
-            use base64::Engine;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            let _ = output_handle.emit("pty://output", encoded);
-        }),
-        Box::new(move |_code| {
-            let _ = exit_handle.emit("pty://exit", ());
-        }),
-    )
-    .map_err(|error| error.to_string())?;
-    *app.state::<AppState>().pty.lock().unwrap() = Some(session);
-    Ok(())
-}
-
-/// Tauri 命令：开合内嵌终端面板，返回开合后的状态。
-#[tauri::command]
-fn terminal_toggle(app: tauri::AppHandle) -> Result<bool, String> {
-    let state = app.state::<AppState>();
-    let open = !state.terminal_open.load(Ordering::Relaxed);
-    state.terminal_open.store(open, Ordering::Relaxed);
-    if open {
-        spawn_pty(&app)?;
-    }
-    relayout(&app);
-    Ok(open)
-}
-
-/// Tauri 命令：向内嵌终端写入键盘输入。
-#[tauri::command]
-fn pty_write(state: tauri::State<'_, AppState>, data: String) -> Result<(), String> {
-    let guard = state.pty.lock().unwrap();
-    match guard.as_ref() {
-        Some(session) => session.write(data.as_bytes()).map_err(|error| error.to_string()),
-        None => Ok(()), // 会话尚未建立或已退出：静默忽略
-    }
-}
-
-/// Tauri 命令：同步终端尺寸（前端 fit 后调用）。
-#[tauri::command]
-fn pty_resize(state: tauri::State<'_, AppState>, rows: u16, cols: u16) -> Result<(), String> {
-    let guard = state.pty.lock().unwrap();
-    match guard.as_ref() {
-        Some(session) => session.resize(rows, cols).map_err(|error| error.to_string()),
-        None => Ok(()),
     }
 }
 
@@ -323,9 +259,10 @@ fn apply_window_theme(app: &tauri::AppHandle, theme: &str) {
             NSApp(mtm).setAppearance(Some(&appearance));
         }
     }
-    // 注意：广播给壳页面用独立事件名——若也用 "theme-changed"，后端 emit
-    // 会被自己的 listener 再次收到，形成无限循环。
-    let _ = app.emit("dsh://theme", serde_json::json!({ "theme": theme }));
+    // 主题存入状态，供壳页面轮询读取（不再走事件——多 webview 下事件不可靠）。
+    if let Some(state) = app.try_state::<AppState>() {
+        *state.theme.lock().unwrap() = theme.to_string();
+    }
 }
 
 fn set_status(
@@ -546,11 +483,7 @@ fn start_dsh(app: &tauri::AppHandle) {
     }
 }
 
-/// 按 `terminal_open` 状态重排主窗口的 content / bar 两个 webview。
-/// bar 总高 = 按钮条(36) + 终端面板（展开时 320，收起时 0）。
-/// 注意：全部用**逻辑坐标**——`set_bounds` 对 Physical 变体的处理与
-/// `add_child` 不一致（实测物理值会被再除一次 scale，导致高度减半、
-/// 点击命中区域错位），逻辑值由 tauri 内部换算，行为与初始 add_child 一致。
+/// 窗口尺寸变化时重排 content / bar 两个 webview（逻辑坐标）。
 fn relayout(app: &tauri::AppHandle) {
     let Some(window) = app.get_window("main") else {
         return;
@@ -562,12 +495,7 @@ fn relayout(app: &tauri::AppHandle) {
         return;
     };
     let inner_logical = inner.to_logical::<f64>(scale);
-    let term_height = if app.state::<AppState>().terminal_open.load(Ordering::Relaxed) {
-        TERMINAL_HEIGHT
-    } else {
-        0.0
-    };
-    let content_height = (inner_logical.height - BAR_HEIGHT - term_height).max(0.0);
+    let content_height = (inner_logical.height - BAR_HEIGHT).max(0.0);
     if let Some(content) = app.get_webview("content") {
         let _ = content.set_bounds(tauri::Rect {
             position: tauri::LogicalPosition::new(0.0, 0.0).into(),
@@ -577,7 +505,7 @@ fn relayout(app: &tauri::AppHandle) {
     if let Some(bar) = app.get_webview("bar") {
         let _ = bar.set_bounds(tauri::Rect {
             position: tauri::LogicalPosition::new(0.0, content_height).into(),
-            size: tauri::LogicalSize::new(inner_logical.width, BAR_HEIGHT + term_height).into(),
+            size: tauri::LogicalSize::new(inner_logical.width, BAR_HEIGHT).into(),
         });
     }
 }
@@ -693,10 +621,6 @@ mod zoom_tests {
 fn request_quit(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let state = app.state::<AppState>();
-        // 先杀内嵌终端的 shell。
-        if let Some(session) = state.pty.lock().unwrap().take() {
-            session.kill();
-        }
         let process = state.process.lock().unwrap().take();
         if let Some(process) = process {
             // 先关 stdin（wrapper 检测 EOF 自杀 dsh），SIGTERM 作双保险。
@@ -774,8 +698,7 @@ pub fn run() {
             state: Mutex::new(DshState::default()),
             dsh_port: Mutex::new(None),
             zoom: AtomicU32::new(100),
-            terminal_open: std::sync::atomic::AtomicBool::new(false),
-            pty: Mutex::new(None),
+            theme: Mutex::new("light".to_string()),
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "zoom_in" => {
@@ -806,9 +729,7 @@ pub fn run() {
             save_config,
             open_settings,
             test_environment,
-            terminal_toggle,
-            pty_write,
-            pty_resize
+            get_theme
         ])
         .setup(|app| {
             build_main_window(app)?;

@@ -110,7 +110,8 @@
     <div id="result"></div>
 
     <script>
-      const T = window.__TAURI__;
+      const T = window.__TAURI_INTERNALS__;
+      const invoke = (cmd, args) => T.invoke(cmd, args);
       const resultEl = document.getElementById('result');
       function setTheme(theme) {
         document.body.classList.toggle('dark', theme === 'dark');
@@ -125,9 +126,10 @@
       }
 
       if (T) {
-        T.event.listen('dsh://theme', (event) => setTheme(event.payload.theme));
-        T.core
-          .invoke('get_config')
+        if (typeof T.listen === 'function') {
+          T.listen('dsh://theme', (event) => setTheme(event.payload.theme));
+        }
+        T.invoke('get_config')
           .then((config) => {
             document.getElementById('dsh-path').value = config.dsh_path || '';
             document.getElementById('node-path').value = config.node_path || '';
@@ -138,8 +140,7 @@
           const inputs = readInputs();
           resultEl.className = '';
           resultEl.textContent = '检测中…';
-          T.core
-            .invoke('test_environment', { dshPath: inputs.dsh_path, nodePath: inputs.node_path })
+          invoke('test_environment', { dshPath: inputs.dsh_path, nodePath: inputs.node_path })
             .then((message) => {
               resultEl.className = 'ok';
               resultEl.textContent = message;
@@ -151,8 +152,7 @@
         });
 
         document.getElementById('save').addEventListener('click', () => {
-          T.core
-            .invoke('save_config', { config: readInputs() })
+          invoke('save_config', { config: readInputs() })
             .then(() => {
               resultEl.className = 'ok';
               resultEl.textContent = '已保存，dsh 正在以新配置重启…';
