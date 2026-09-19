@@ -14,7 +14,8 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 0 12px;
+        /* 左侧避让 macOS 红绿灯按钮区域 */
+        padding: 0 12px 0 88px;
         box-sizing: border-box;
         background: var(--bg);
         color: var(--fg);
@@ -72,6 +73,7 @@
       <button id="restart" hidden title="重新启动 dsh 后端">重启</button>
       <button id="logs" title="在 Finder 中显示日志目录">日志</button>
       <button id="settings" title="配置 dsh / node 路径">设置</button>
+      <button id="terminal" title="在窗口下方打开系统终端">终端</button>
     </div>
     <script>
       // 与 chat-app 同款通信层：直接走 __TAURI_INTERNALS__（不依赖全局包）。
@@ -120,6 +122,9 @@
         });
         document.getElementById('settings').addEventListener('click', () => {
           invoke('open_settings').catch(() => {});
+        });
+        document.getElementById('terminal').addEventListener('click', () => {
+          invoke('open_terminal').catch(() => {});
         });
         document.getElementById('restart').addEventListener('click', () => {
           invoke('restart_dsh').catch(() => {});

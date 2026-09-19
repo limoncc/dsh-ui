@@ -10,7 +10,7 @@ use tauri::webview::WebviewBuilder;
 use tauri::window::WindowBuilder;
 use tauri::{Emitter, Listener, Manager, State, WebviewUrl};
 
-/// 底部状态条高度（逻辑像素）。
+/// 顶部状态条高度（逻辑像素）。
 const BAR_HEIGHT: f64 = 36.0;
 
 /// 注入 dsh 页面：检测网页明暗主题。
@@ -505,16 +505,17 @@ fn relayout(app: &tauri::AppHandle) {
     };
     let inner_logical = inner.to_logical::<f64>(scale);
     let content_height = (inner_logical.height - BAR_HEIGHT).max(0.0);
-    if let Some(content) = app.get_webview("content") {
-        let _ = content.set_bounds(tauri::Rect {
-            position: tauri::LogicalPosition::new(0.0, 0.0).into(),
-            size: tauri::LogicalSize::new(inner_logical.width, content_height).into(),
-        });
-    }
+    // 顶部条在上（0..BAR_HEIGHT），content 在其下。
     if let Some(bar) = app.get_webview("bar") {
         let _ = bar.set_bounds(tauri::Rect {
-            position: tauri::LogicalPosition::new(0.0, content_height).into(),
+            position: tauri::LogicalPosition::new(0.0, 0.0).into(),
             size: tauri::LogicalSize::new(inner_logical.width, BAR_HEIGHT).into(),
+        });
+    }
+    if let Some(content) = app.get_webview("content") {
+        let _ = content.set_bounds(tauri::Rect {
+            position: tauri::LogicalPosition::new(0.0, BAR_HEIGHT).into(),
+            size: tauri::LogicalSize::new(inner_logical.width, content_height).into(),
         });
     }
 }
@@ -566,19 +567,130 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
             }
             allowed
         });
-    window.add_child(
-        content,
-        tauri::LogicalPosition::new(0.0, 0.0),
-        tauri::LogicalSize::new(width, content_height),
-    )?;
-
     let bar = WebviewBuilder::new("bar", WebviewUrl::App("bar.html".into()));
     window.add_child(
         bar,
-        tauri::LogicalPosition::new(0.0, content_height),
+        tauri::LogicalPosition::new(0.0, 0.0),
         tauri::LogicalSize::new(width, BAR_HEIGHT),
     )?;
+
+    window.add_child(
+        content,
+        tauri::LogicalPosition::new(0.0, BAR_HEIGHT),
+        tauri::LogicalSize::new(width, content_height),
+    )?;
     Ok(())
+}
+
+/// 屏幕上的矩形（物理像素，左上原点）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// 计算终端窗口的目标位置：与主窗口同宽、正下方留 `gap` 间距，
+/// 高度取 `max_height` 与屏幕底部余量的较小者（至少 `min_height`），
+/// 整体不越出屏幕。
+pub fn terminal_bounds(
+    window: Rect,
+    screen: Rect,
+    gap: f64,
+    max_height: f64,
+    min_height: f64,
+) -> Rect {
+    let desired_y = window.y + window.h + gap;
+    let screen_bottom = screen.y + screen.h;
+    let height = max_height.min((screen_bottom - desired_y).max(min_height));
+    let y = desired_y.min(screen_bottom - height);
+    let width = window.w.min(screen.w);
+    let x = window.x.clamp(screen.x, screen.x + screen.w - width);
+    Rect { x, y, w: width, h: height }
+}
+
+#[cfg(test)]
+mod terminal_bounds_tests {
+    use super::{terminal_bounds, Rect};
+
+    const SCREEN: Rect = Rect { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 };
+
+    #[test]
+    fn terminal_sits_below_window_with_max_height_when_space_allows() {
+        let window = Rect { x: 100.0, y: 50.0, w: 1200.0, h: 300.0 };
+        let bounds = terminal_bounds(window, SCREEN, 8.0, 480.0, 120.0);
+        assert_eq!(
+            bounds,
+            Rect { x: 100.0, y: 358.0, w: 1200.0, h: 480.0 },
+            "应正对窗口下方、留 8px 间距；余量 542 > 480，高度取上限"
+        );
+    }
+
+    #[test]
+    fn terminal_keeps_min_height_when_window_touches_screen_bottom() {
+        let window = Rect { x: 0.0, y: 0.0, w: 1200.0, h: 900.0 };
+        let bounds = terminal_bounds(window, SCREEN, 8.0, 480.0, 120.0);
+        assert_eq!(bounds.h, 120.0, "无空间时保持最小高度");
+        assert_eq!(bounds.y, 780.0, "y 收进屏幕底边");
+    }
+}
+
+/// 在主窗口正下方打开 Terminal.app 新窗口。
+fn open_terminal_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_window("main") else {
+        return;
+    };
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+        return;
+    };
+    let window_rect = Rect {
+        x: f64::from(position.x),
+        y: f64::from(position.y),
+        w: f64::from(size.width),
+        h: f64::from(size.height),
+    };
+    let screen_rect = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| Rect {
+            x: f64::from(monitor.position().x),
+            y: f64::from(monitor.position().y),
+            w: f64::from(monitor.size().width),
+            h: f64::from(monitor.size().height),
+        })
+        .unwrap_or(window_rect);
+    let bounds = terminal_bounds(window_rect, screen_rect, 8.0, 480.0, 120.0);
+
+    // AppleScript bounds 为 {left, top, right, bottom}（顶部原点，与 Tauri 一致）。
+    let script = format!(
+        "tell application \"Terminal\"\n\
+         \x20 activate\n\
+         \x20 do script \"\"\n\
+         \x20 set bounds of front window to {{{x}, {y}, {right}, {bottom}}}\n\
+         end tell",
+        x = bounds.x as i32,
+        y = bounds.y as i32,
+        right = (bounds.x + bounds.w) as i32,
+        bottom = (bounds.y + bounds.h) as i32,
+    );
+    match std::process::Command::new("/usr/bin/osascript").arg("-e").arg(&script).output() {
+        Ok(output) if !output.status.success() => {
+            eprintln!(
+                "open_terminal: osascript 失败: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(error) => eprintln!("open_terminal: 无法启动 osascript: {error}"),
+        _ => {}
+    }
+}
+
+/// Tauri 命令：打开系统终端（在 APP 正下方）。
+#[tauri::command]
+fn open_terminal(app: tauri::AppHandle) {
+    open_terminal_window(&app);
 }
 
 /// 缩放档位（百分比），Safari 风格；Cmd+=/-/0 与预设菜单共用。
@@ -747,7 +859,8 @@ pub fn run() {
             save_config,
             open_settings,
             test_environment,
-            get_theme
+            get_theme,
+            open_terminal
         ])
         .setup(|app| {
             build_main_window(app)?;
