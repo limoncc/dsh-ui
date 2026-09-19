@@ -28,3 +28,5 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSAppearance"] 
 
 [dev-dependencies]
 tempfile = "3"
+tauri-utils = "2"
+url = "2"

@@ -13,7 +13,12 @@ use tauri::{Emitter, Listener, Manager, State, WebviewUrl};
 /// 底部状态条高度（逻辑像素）。
 const BAR_HEIGHT: f64 = 36.0;
 
-/// 注入 dsh 页面：检测网页明暗主题并回报给壳（移植自 deepseek_app）。
+/// 注入 dsh 页面：检测网页明暗主题。
+///
+/// 上报通道是「导航信号」：主题变化时把 `location.href` 指到
+/// `dsh-theme://dark|light`，由 Rust 的 `on_navigation` 拦截并阻止。
+/// 不走 Tauri IPC——多 WebView 下远程页面的自定义命令被 ACL 拒绝，
+/// 而导航回调在 Rust 侧 100% 可靠。
 const THEME_DETECT_SCRIPT: &str = r#"
 (function(){
     function getTheme(){
@@ -51,7 +56,11 @@ const THEME_DETECT_SCRIPT: &str = r#"
         return'light';
     }
     function report(t){
-        try{window.__TAURI_INTERNALS__.invoke('report_theme',{theme:t}).catch(function(){})}catch(e){}
+        // 去重标记不进 Observer 的过滤列表，避免自触发。
+        if(document.documentElement.getAttribute('data-dsh-ui-theme')!==t){
+            document.documentElement.setAttribute('data-dsh-ui-theme',t);
+            location.href='dsh-theme://'+t;
+        }
     }
     function setup(){
         report(getTheme());
@@ -224,15 +233,6 @@ fn open_log_dir() {
     if let Some(dir) = dsh::log_dir() {
         let _ = std::process::Command::new("open").arg("-R").arg(dir).spawn();
     }
-}
-
-/// Tauri 命令：dsh 页面的主题检测脚本经此回报主题变化。
-#[tauri::command]
-fn report_theme(app: tauri::AppHandle, theme: String) {
-    let normalized = dsh::normalize_theme(&theme).to_string();
-    let handle = app.clone();
-    let callback = handle.clone();
-    let _ = handle.run_on_main_thread(move || apply_window_theme(&callback, &normalized));
 }
 
 /// 让 macOS 窗口原生外观（材质与 NSAppearance）跟随 dsh 页面主题，
@@ -542,17 +542,27 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
     let content_height = (inner_logical.height - BAR_HEIGHT).max(0.0);
     let width = inner_logical.width;
 
-    // content：导航锁定——只放行壳页面与当前 dsh 端口，其余转系统浏览器。
+    // content：导航锁定——主题信号在本回调直取（100% 可靠），
+    // 只放行壳页面与当前 dsh 端口，其余转系统浏览器。
     let app_handle = app.handle().clone();
     let content = WebviewBuilder::new("content", WebviewUrl::App("loading.html".into()))
         .initialization_script(THEME_DETECT_SCRIPT)
         .on_navigation(move |url| {
+            let url_str = url.as_str();
+            if let Some(theme) = dsh::parse_theme_navigation(url_str) {
+                let handle = app_handle.clone();
+                let callback = handle.clone();
+                let _ = handle.run_on_main_thread(move || {
+                    apply_window_theme(&callback, theme);
+                });
+                return false; // 信号已消费，不产生真实导航
+            }
             let allowed = dsh::is_allowed_navigation(
-                url.as_str(),
+                url_str,
                 *app_handle.state::<AppState>().dsh_port.lock().unwrap(),
             );
             if !allowed {
-                let _ = std::process::Command::new("open").arg(url.as_str()).spawn();
+                let _ = std::process::Command::new("open").arg(url_str).spawn();
             }
             allowed
         });
@@ -731,7 +741,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_dsh_state,
             diag_report,
-            report_theme,
             restart_dsh,
             open_log_dir,
             get_config,

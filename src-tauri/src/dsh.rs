@@ -136,6 +136,15 @@ pub fn is_allowed_navigation(url: &str, port: Option<u16>) -> bool {
     rest[..authority_end].parse::<u16>() == Ok(port)
 }
 
+/// 解析主题导航信号 URL（`dsh-theme://dark|light`）；非主题导航返回 None。
+pub fn parse_theme_navigation(url: &str) -> Option<&'static str> {
+    match url.strip_prefix("dsh-theme://")? {
+        "dark" => Some("dark"),
+        "light" => Some("light"),
+        _ => None,
+    }
+}
+
 /// 把页面检测到的主题归一化为 "light"/"dark"；未知值按 light 处理。
 pub fn normalize_theme(theme: &str) -> &'static str {
     if theme == "dark" {
@@ -1080,5 +1089,24 @@ wait "$pid"
             Ok(DshEvent::Exited { .. }) => {}
             other => panic!("expected exit after stdin close, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod theme_nav_tests {
+    use super::parse_theme_navigation;
+
+    #[test]
+    fn theme_navigation_url_parses_to_theme() {
+        assert_eq!(parse_theme_navigation("dsh-theme://dark"), Some("dark"));
+        assert_eq!(parse_theme_navigation("dsh-theme://light"), Some("light"));
+    }
+
+    #[test]
+    fn theme_navigation_rejects_other_urls_and_themes() {
+        assert_eq!(parse_theme_navigation("dsh-theme://blue"), None);
+        assert_eq!(parse_theme_navigation("http://127.0.0.1:3080/?token=t"), None);
+        assert_eq!(parse_theme_navigation("tauri://localhost/bar.html"), None);
+        assert_eq!(parse_theme_navigation(""), None);
     }
 }
