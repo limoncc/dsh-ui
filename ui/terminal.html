@@ -76,8 +76,9 @@
       let pulling = false;
 
       async function pullOutput() {
-        // 面板收起时暂停拉取；展开后从上次游标继续（环形缓冲保留近期输出）。
-        if (!term || pulling || !(await invoke('get_terminal_open').catch(() => false))) return;
+        // 拉取无条件运行（webview 常驻 320 高、页面加载即初始化）；
+        // 面板可见性由 Rust relayout/hide 控制，与此处解耦。
+        if (!term || pulling) return;
         pulling = true;
         try {
           // 长轮询：Rust 侧最多等 150ms，有数据立即返回。
@@ -95,6 +96,8 @@
       }
 
       if (T) {
+        // 页面加载即初始化终端（webview 常驻 320 高，无需等待展开）。
+        initTerminal();
         // 输出拉取循环（可靠 IPC 通道，不走事件）。
         (async () => {
           for (;;) {
