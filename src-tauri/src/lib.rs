@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+pub mod mac_titlebar;
 pub mod dsh;
 pub mod settings;
 
@@ -218,21 +220,31 @@ fn get_theme(state: State<'_, AppState>) -> String {
     state.theme.lock().unwrap().clone()
 }
 
-/// Tauri 命令：重启 dsh（停止旧进程后重新探测并 spawn）。
-#[tauri::command]
-fn restart_dsh(app: tauri::AppHandle) {
+/// 重启 dsh 的实现（命令与原生标题栏共用）。
+pub(crate) fn restart_dsh_impl(app: &tauri::AppHandle) {
     if let Some(process) = app.state::<AppState>().process.lock().unwrap().take() {
         process.stop();
     }
-    start_dsh(&app);
+    start_dsh(app);
+}
+
+/// Tauri 命令：重启 dsh（停止旧进程后重新探测并 spawn）。
+#[tauri::command]
+fn restart_dsh(app: tauri::AppHandle) {
+    restart_dsh_impl(&app);
+}
+
+/// 在 Finder 中显示 dsh 日志目录的实现。
+pub(crate) fn open_log_dir_impl() {
+    if let Some(dir) = dsh::log_dir() {
+        let _ = std::process::Command::new("open").arg("-R").arg(dir).spawn();
+    }
 }
 
 /// Tauri 命令：在 Finder 中显示 dsh 日志目录。
 #[tauri::command]
 fn open_log_dir() {
-    if let Some(dir) = dsh::log_dir() {
-        let _ = std::process::Command::new("open").arg("-R").arg(dir).spawn();
-    }
+    open_log_dir_impl();
 }
 
 /// 让 macOS 窗口原生外观（材质与 NSAppearance）跟随 dsh 页面主题，
@@ -380,16 +392,15 @@ fn save_config(app: tauri::AppHandle, config: settings::AppConfig) -> Result<(),
     Ok(())
 }
 
-/// 打开设置窗口（已存在则聚焦）。
-#[tauri::command]
-fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
+/// 打开设置窗口的实现（命令与原生标题栏共用）。
+pub(crate) fn open_settings_window(app: &tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("settings") {
         let _ = window.show();
         let _ = window.set_focus();
         return Ok(());
     }
     tauri::WebviewWindowBuilder::new(
-        &app,
+        app,
         "settings",
         tauri::WebviewUrl::App("settings.html".into()),
     )
@@ -399,6 +410,12 @@ fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
     .build()
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+/// Tauri 命令：打开设置窗口（已存在则聚焦）。
+#[tauri::command]
+fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
+    open_settings_window(&app)
 }
 
 /// 设置窗口的"测试"按钮：按当前输入做一次探测，返回人话结果。
@@ -524,7 +541,7 @@ fn relayout(app: &tauri::AppHandle) {
 ///
 /// 布局全手动（不用 auto_resize）：按钮条固定高度 + 终端面板开合无法用
 /// 等比缩放表达，窗口变化时由 [`relayout`] 重排。
-fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
+fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry>> {
     let window = WindowBuilder::new(app, "main")
         .title("dsh-ui")
         .inner_size(1200.0, 800.0)
@@ -540,7 +557,7 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
     let inner = window.inner_size()?;
     let scale = window.scale_factor().unwrap_or(1.0);
     let inner_logical = inner.to_logical::<f64>(scale);
-    let content_height = (inner_logical.height - BAR_HEIGHT).max(0.0);
+    let content_height = inner_logical.height.max(0.0);
     let width = inner_logical.width;
 
     // content：导航锁定——主题信号在本回调直取（100% 可靠），
@@ -567,19 +584,12 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<()> {
             }
             allowed
         });
-    let bar = WebviewBuilder::new("bar", WebviewUrl::App("bar.html".into()));
-    window.add_child(
-        bar,
-        tauri::LogicalPosition::new(0.0, 0.0),
-        tauri::LogicalSize::new(width, BAR_HEIGHT),
-    )?;
-
     window.add_child(
         content,
-        tauri::LogicalPosition::new(0.0, BAR_HEIGHT),
+        tauri::LogicalPosition::new(0.0, 0.0),
         tauri::LogicalSize::new(width, content_height),
     )?;
-    Ok(())
+    Ok(window)
 }
 
 /// 屏幕上的矩形（物理像素，左上原点）。
@@ -685,12 +695,6 @@ fn open_terminal_window(app: &tauri::AppHandle) {
         Err(error) => eprintln!("open_terminal: 无法启动 osascript: {error}"),
         _ => {}
     }
-}
-
-/// Tauri 命令：打开系统终端（在 APP 正下方）。
-#[tauri::command]
-fn open_terminal(app: tauri::AppHandle) {
-    open_terminal_window(&app);
 }
 
 /// 缩放档位（百分比），Safari 风格；Cmd+=/-/0 与预设菜单共用。
@@ -859,11 +863,10 @@ pub fn run() {
             save_config,
             open_settings,
             test_environment,
-            get_theme,
-            open_terminal
+            get_theme
         ])
         .setup(|app| {
-            build_main_window(app)?;
+            let window = build_main_window(app)?;
             #[cfg(target_os = "macos")]
             {
                 build_menu(app)?;
@@ -887,6 +890,26 @@ pub fn run() {
                 });
             });
             apply_window_theme(app.handle(), "light");
+            // 原生标题栏按钮（状态/日志/设置/终端，右侧与红绿灯同行）。
+            #[cfg(target_os = "macos")]
+            mac_titlebar::setup(&window)?;
+            // 标题栏状态按钮轮询（原生更新，不依赖 webview）。
+            #[cfg(target_os = "macos")]
+            {
+                let poll_handle = app.handle().clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(Duration::from_millis(800));
+                    let state = poll_handle.state::<AppState>();
+                    let snapshot = state.state.lock().unwrap().clone();
+                    let title = match snapshot.status.as_str() {
+                        "ready" => "● 已连接",
+                        "stopped" => "● dsh 已停止",
+                        "error" => "● 启动失败",
+                        _ => "● 启动中",
+                    };
+                    mac_titlebar::update_status_on_main(&poll_handle, title.to_string());
+                });
+            }
             start_dsh(app.handle());
             Ok(())
         })
