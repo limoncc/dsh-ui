@@ -130,7 +130,7 @@ pub fn rebuild(window: &tauri::Window) -> tauri::Result<()> {
 
     // 从左到右：状态 / 日志 / 设置 / 终端。
     let status_btn = unsafe {
-        make_button(mtm, target_obj, sel!(statusClicked:), "● 启动中")
+        make_button(mtm, target_obj, sel!(statusClicked:), "🟡 启动中")
     };
     let logs_btn =
         unsafe { make_button(mtm, target_obj, sel!(logsClicked:), "日志") };

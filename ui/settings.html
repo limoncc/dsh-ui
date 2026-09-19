@@ -126,9 +126,11 @@
       }
 
       if (T) {
-        if (typeof T.listen === 'function') {
-          T.listen('dsh://theme', (event) => setTheme(event.payload.theme));
-        }
+        setInterval(async () => {
+          try {
+            setTheme(await invoke('get_theme'));
+          } catch (e) {}
+        }, 1200);
         T.invoke('get_config')
           .then((config) => {
             document.getElementById('dsh-path').value = config.dsh_path || '';

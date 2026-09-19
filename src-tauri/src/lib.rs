@@ -208,12 +208,6 @@ fn get_dsh_state(state: State<'_, AppState>) -> DshState {
     state.state.lock().unwrap().clone()
 }
 
-/// 诊断命令：壳页面把 JS 侧 API 状态回传，Rust 打到 stderr（dev 日志可见）。
-#[tauri::command]
-fn diag_report(source: String, info: String) {
-    eprintln!("[diag] {source}: {info}");
-}
-
 /// Tauri 命令：当前主题（壳页面轮询，替代不可靠的事件推送）。
 #[tauri::command]
 fn get_theme(state: State<'_, AppState>) -> String {
@@ -856,7 +850,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_dsh_state,
-            diag_report,
             restart_dsh,
             open_log_dir,
             get_config,
@@ -902,10 +895,10 @@ pub fn run() {
                     let state = poll_handle.state::<AppState>();
                     let snapshot = state.state.lock().unwrap().clone();
                     let title = match snapshot.status.as_str() {
-                        "ready" => "● 已连接",
-                        "stopped" => "● dsh 已停止",
-                        "error" => "● 启动失败",
-                        _ => "● 启动中",
+                        "ready" => "🟢 已连接",
+                        "stopped" => "🔴 dsh 已停止",
+                        "error" => "🔴 启动失败",
+                        _ => "🟡 启动中",
                     };
                     mac_titlebar::update_status_on_main(&poll_handle, title.to_string());
                 });
