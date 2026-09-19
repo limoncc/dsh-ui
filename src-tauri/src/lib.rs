@@ -178,7 +178,7 @@ fn open_log_dir() {
 /// Tauri 命令：在主窗口正下方打开 Terminal.app 新窗口。
 #[tauri::command]
 fn open_terminal(app: tauri::AppHandle) {
-    let Some(window) = app.get_webview_window("main") else {
+    let Some(window) = app.get_window("main") else {
         return;
     };
     let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) else {
@@ -215,7 +215,17 @@ fn open_terminal(app: tauri::AppHandle) {
         right = (bounds.x + bounds.w) as i32,
         bottom = (bounds.y + bounds.h) as i32,
     );
-    let _ = std::process::Command::new("/usr/bin/osascript").arg("-e").arg(&script).spawn();
+    // 等待 osascript 结束并记录失败原因（如未授予自动化权限），避免静默无反应。
+    match std::process::Command::new("/usr/bin/osascript").arg("-e").arg(&script).output() {
+        Ok(output) if !output.status.success() => {
+            eprintln!(
+                "open_terminal: osascript 失败: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(error) => eprintln!("open_terminal: 无法启动 osascript: {error}"),
+        _ => {}
+    }
 }
 
 /// Tauri 命令：dsh 页面的主题检测脚本经此回报主题变化。
@@ -599,7 +609,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => {
-                if let Some(window) = app.get_webview_window("main") {
+                if let Some(window) = app.get_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
@@ -615,7 +625,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
             } = event
             {
                 let app = tray.app_handle();
-                if let Some(window) = app.get_webview_window("main") {
+                if let Some(window) = app.get_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
@@ -629,7 +639,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
@@ -707,7 +717,7 @@ pub fn run() {
         .run(|app, event| {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
-                if let Some(window) = app.get_webview_window("main") {
+                if let Some(window) = app.get_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
