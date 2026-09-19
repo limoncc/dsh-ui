@@ -269,6 +269,8 @@ fn spawn_pty(app: &tauri::AppHandle) -> Result<(), String> {
             let _ = output_handle.emit("pty://output", encoded);
         }),
         Box::new(move |_code| {
+            // shell 退出后清掉会话：下次展开面板自动重启新 shell。
+            *exit_handle.state::<AppState>().pty.lock().unwrap() = None;
             let _ = exit_handle.emit("pty://exit", ());
         }),
     )
