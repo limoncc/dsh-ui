@@ -128,9 +128,28 @@ pub enum EnvCheck {
     NodeTooOld { major: u32 },
 }
 
+/// Windows：给子进程加 CREATE_NO_WINDOW——不弹控制台黑窗。
+/// 黑窗被用户关闭会连带杀掉整棵控制台进程树（dsh 即死），隐藏后无从关闭。
+/// 版本探测 / taskkill 同样不再闪窗。非 Windows 无控制台概念，为 no-op。
+fn apply_no_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// 捕获一个可执行文件带参数运行后的 stdout（启动失败或非零退出返回 None）。
 fn run_and_capture_output(program: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program).args(args).output().ok()?;
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    apply_no_window(&mut command);
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -418,6 +437,8 @@ impl DshProcess {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        // Windows：隐藏 cmd 控制台黑窗（关窗会杀掉 dsh 进程树）。
+        apply_no_window(&mut command);
 
         let mut child = command.spawn()?;
         let pid = child.id() as i32;
@@ -598,11 +619,13 @@ fn terminate_child(pid: i32, force: bool) {
 #[cfg(windows)]
 fn terminate_child(pid: i32, _force: bool) {
     // /T 杀进程树（dsh 可能有子进程），/F 强制；进程已死时 taskkill 报错，忽略。
-    let _ = std::process::Command::new("taskkill")
+    let mut command = std::process::Command::new("taskkill");
+    command
         .args(["/T", "/PID", &pid.to_string(), "/F"])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stderr(std::process::Stdio::null());
+    apply_no_window(&mut command);
+    let _ = command.status();
 }
 
 /// Windows 防孤儿：Job Object —— 关联子进程后，本进程死亡（含被强杀，
@@ -713,6 +736,25 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// apply_no_window 后 spawn 仍正常：Windows 上验证 CREATE_NO_WINDOW
+    /// 不破坏进程创建，非 Windows 上验证 helper 是安全 no-op。
+    #[test]
+    fn apply_no_window_keeps_spawn_working() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "echo", "ok"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.args(["-c", "echo ok"]);
+            c
+        };
+        apply_no_window(&mut cmd);
+        let out = cmd.output().expect("spawn after apply_no_window");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("ok"));
     }
 
     #[test]
