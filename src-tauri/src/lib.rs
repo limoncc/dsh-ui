@@ -199,6 +199,67 @@ fn build_menu(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+/// 顶部工具栏高度（非 macOS 用 webview 工具栏；macOS 用原生标题栏按钮，无此栏）。
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+const TOOLBAR_HEIGHT: f64 = 32.0;
+
+/// 内容区 y 偏移：macOS 原生标题栏按钮（无 webview 工具栏）= 0；
+/// 其余平台顶部有 32px 工具栏 webview（chat-app 双轨方案）。
+#[cfg(target_os = "macos")]
+fn content_offset() -> f64 {
+    0.0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn content_offset() -> f64 {
+    TOOLBAR_HEIGHT
+}
+
+/// 内容区 bounds：(0, 偏移) 起，满宽，高度 = 窗口高 - 偏移（钳 0）。
+/// 所有 content webview 的创建与重排都走此入口，保证不盖住顶部工具栏。
+fn content_bounds(
+    win_w: f64,
+    win_h: f64,
+) -> (tauri::LogicalPosition<f64>, tauri::LogicalSize<f64>) {
+    let offset = content_offset();
+    (
+        tauri::LogicalPosition::new(0.0, offset),
+        tauri::LogicalSize::new(win_w.max(0.0), (win_h - offset).max(0.0)),
+    )
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{content_bounds, content_offset, TOOLBAR_HEIGHT};
+
+    /// 内容区偏移按平台：macOS 原生标题栏按钮无工具栏 = 0；其余 = 32。
+    #[test]
+    fn content_offset_matches_platform() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(content_offset(), 0.0);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(content_offset(), TOOLBAR_HEIGHT);
+    }
+
+    /// 内容区 bounds：满宽、从偏移处起、高度扣除工具栏。
+    #[test]
+    fn content_bounds_offsets_from_toolbar_top() {
+        let (pos, size) = content_bounds(1200.0, 800.0);
+        assert_eq!(pos.x, 0.0);
+        assert_eq!(pos.y, content_offset());
+        assert_eq!(size.width, 1200.0);
+        assert_eq!(size.height, (800.0 - content_offset()).max(0.0));
+    }
+
+    /// 高度不足以覆盖偏移时钳为 0（负输入两平台恒为 0）。
+    #[test]
+    fn content_bounds_clamps_height_to_zero() {
+        let (_, size) = content_bounds(1200.0, -50.0);
+        assert_eq!(size.height, 0.0);
+        assert_eq!(size.width, 1200.0);
+    }
+}
+
 #[tauri::command]
 fn get_dsh_state(state: State<'_, AppState>) -> DshState {
     state.state.lock().unwrap().clone()
@@ -538,10 +599,19 @@ fn relayout(app: &tauri::AppHandle) {
         return;
     };
     let inner_logical = inner.to_logical::<f64>(scale);
+    let (content_pos, content_size) = content_bounds(inner_logical.width, inner_logical.height);
     if let Some(content) = app.get_webview("content") {
         let _ = content.set_bounds(tauri::Rect {
+            position: content_pos.into(),
+            size: content_size.into(),
+        });
+    }
+    // 非 macOS：工具栏永远贴顶满宽（子 webview 不自动跟随 resize，必须重排）。
+    #[cfg(not(target_os = "macos"))]
+    if let Some(toolbar) = app.get_webview("toolbar") {
+        let _ = toolbar.set_bounds(tauri::Rect {
             position: tauri::LogicalPosition::new(0.0, 0.0).into(),
-            size: tauri::LogicalSize::new(inner_logical.width, inner_logical.height).into(),
+            size: tauri::LogicalSize::new(inner_logical.width, TOOLBAR_HEIGHT).into(),
         });
     }
 }
@@ -580,8 +650,17 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry
     let inner = window.inner_size()?;
     let scale = window.scale_factor().unwrap_or(1.0);
     let inner_logical = inner.to_logical::<f64>(scale);
-    let content_height = inner_logical.height.max(0.0);
     let width = inner_logical.width;
+    let (content_pos, content_size) = content_bounds(width, inner_logical.height);
+
+    // 非 macOS：顶部工具栏 webview（原生标题栏下方客户区顶部）；
+    // macOS 用原生标题栏按钮，不创建。
+    #[cfg(not(target_os = "macos"))]
+    window.add_child(
+        WebviewBuilder::new("toolbar", WebviewUrl::App("toolbar.html".into())),
+        tauri::LogicalPosition::new(0.0, 0.0),
+        tauri::LogicalSize::new(width, TOOLBAR_HEIGHT),
+    )?;
 
     // content：导航锁定——主题信号在本回调直取（100% 可靠），
     // 只放行壳页面与当前 dsh 端口，其余转系统浏览器。
@@ -607,11 +686,7 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry
             }
             allowed
         });
-    window.add_child(
-        content,
-        tauri::LogicalPosition::new(0.0, 0.0),
-        tauri::LogicalSize::new(width, content_height),
-    )?;
+    window.add_child(content, content_pos, content_size)?;
 
     Ok(window)
 }

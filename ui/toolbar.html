@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>dsh-ui 工具栏</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+        overflow: hidden;
+      }
+      /* 顶部工具栏（仅非 macOS 创建；macOS 用原生标题栏按钮）。
+         高度与 Rust 侧 TOOLBAR_HEIGHT 保持一致（32px）。 */
+      body {
+        background: #f5f5f7;
+        color: #3a3a3c;
+        font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        font-size: 12px;
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+        -webkit-user-select: none;
+        user-select: none;
+        -webkit-app-region: drag; /* 空白区域拖动窗口 */
+      }
+      body.dark {
+        background: #1e1e20;
+        color: #d1d1d6;
+      }
+      /* 交互区不参与窗口拖动 */
+      #status,
+      #right {
+        -webkit-app-region: no-drag;
+      }
+      #status {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 8px;
+        border-radius: 6px;
+        cursor: pointer;
+        border: 1px solid transparent;
+      }
+      #status:hover {
+        background: rgba(127, 127, 127, 0.15);
+      }
+      #right {
+        margin-left: auto;
+        display: flex;
+        gap: 6px;
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #f39c12;
+        flex: none;
+      }
+      .dot.ready {
+        background: #27ae60;
+      }
+      .dot.stopped,
+      .dot.error {
+        background: #c0392b;
+      }
+      .btn {
+        padding: 3px 10px;
+        border: 1px solid rgba(127, 127, 127, 0.35);
+        border-radius: 6px;
+        background: transparent;
+        color: inherit;
+        font-size: 12px;
+        cursor: pointer;
+        -webkit-app-region: no-drag;
+      }
+      .btn:hover {
+        background: rgba(127, 127, 127, 0.15);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status" title="点击重启 dsh">
+      <span class="dot" id="dot"></span>
+      <span id="status-text">启动中…</span>
+    </div>
+    <div id="right">
+      <button class="btn" id="logs" title="在文件管理器中显示日志目录">日志</button>
+      <button class="btn" id="settings" title="配置 dsh / node 路径">设置</button>
+    </div>
+    <script>
+      // 与 loading/settings 同款通信层：直接走 __TAURI_INTERNALS__（chat-app 同模式）。
+      const T = window.__TAURI_INTERNALS__;
+      const invoke = (cmd, args) => T.invoke(cmd, args);
+      const LABELS = {
+        starting: '启动中…',
+        ready: '已连接',
+        stopped: 'dsh 已停止',
+        error: '启动失败',
+      };
+      let lastStatus = '';
+
+      function applyState(state) {
+        if (!state || state.status === lastStatus) return;
+        lastStatus = state.status;
+        document.getElementById('dot').className = 'dot ' + state.status;
+        document.getElementById('status-text').textContent =
+          LABELS[state.status] || state.status;
+      }
+      function setTheme(theme) {
+        document.body.classList.toggle('dark', theme === 'dark');
+      }
+      setTheme(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+
+      if (T) {
+        // 状态/主题轮询：沿用 loading 页已验证的可靠轮询模式，不依赖跨 webview 事件。
+        setInterval(async () => {
+          try {
+            applyState(await invoke('get_dsh_state'));
+          } catch (e) {}
+        }, 800);
+        setInterval(async () => {
+          try {
+            setTheme(await invoke('get_theme'));
+          } catch (e) {}
+        }, 1200);
+
+        // 状态按钮点击 = 重启 dsh（与 macOS 原生标题栏状态按钮一致）。
+        document.getElementById('status').addEventListener('click', () => {
+          invoke('restart_dsh').catch(() => {});
+        });
+        document.getElementById('logs').addEventListener('click', () => {
+          invoke('open_log_dir').catch(() => {});
+        });
+        document.getElementById('settings').addEventListener('click', () => {
+          invoke('open_settings').catch(() => {});
+        });
+      }
+    </script>
+  </body>
+</html>
