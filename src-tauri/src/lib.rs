@@ -128,8 +128,7 @@ fn apply_zoom(app: &tauri::AppHandle, percent: u32) {
     }
 }
 
-/// 构建 macOS 原生菜单（App/Edit/View/Window，移植自 deepseek_app）。
-#[cfg(target_os = "macos")]
+/// 构建原生菜单（App/Edit/View/Window，tauri::menu 跨平台；移植自 deepseek_app）。
 fn build_menu(app: &tauri::App) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 
@@ -225,11 +224,19 @@ fn restart_dsh(app: tauri::AppHandle) {
     restart_dsh_impl(&app);
 }
 
-/// 在 Finder 中显示 dsh 日志目录的实现。
+/// 在系统文件管理器中显示 dsh 日志目录的实现（Finder / Explorer / xdg-open）。
 pub(crate) fn open_log_dir_impl() {
-    if let Some(dir) = dsh::log_dir() {
-        let _ = std::process::Command::new("open").arg("-R").arg(dir).spawn();
-    }
+    let Some(dir) = dsh::log_dir() else {
+        return;
+    };
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-R").arg(dir).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", dir.display()))
+        .spawn();
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
 }
 
 /// Tauri 命令：在 Finder 中显示 dsh 日志目录。
@@ -238,6 +245,23 @@ fn open_log_dir() {
     open_log_dir_impl();
 }
 
+
+/// 用系统默认程序打开外部 URL/路径：macOS `open`、Windows `ShellExecuteW`
+///（不走 cmd/start，规避 URL 中 `&` 等字符的 cmd 解析注入）、Linux `xdg-open`。
+fn open_external(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    {
+        use windows::core::{w, HSTRING};
+        use windows::Win32::UI::Shell::{ShellExecuteW, SW_SHOWNORMAL};
+        let _ = unsafe {
+            ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL)
+        };
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
 
 /// 让 macOS 窗口原生外观（材质与 NSAppearance）跟随 dsh 页面主题，
 /// 并广播给 bar/loading 页面切换配色。必须在主线程调用。
@@ -578,7 +602,7 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::Window<tauri::Wry
                 *app_handle.state::<AppState>().dsh_port.lock().unwrap(),
             );
             if !allowed {
-                let _ = std::process::Command::new("open").arg(url_str).spawn();
+                open_external(url_str);
             }
             allowed
         });
@@ -664,8 +688,8 @@ fn request_quit(app: tauri::AppHandle) {
     });
 }
 
-/// 构建系统托盘：显示/退出菜单 + 左键点击唤起窗口（移植自 deepseek_app）。
-#[cfg(target_os = "macos")]
+/// 构建系统托盘：显示/退出菜单 + 左键点击唤起窗口（tauri tray API 跨平台；
+/// Windows 关窗即隐藏，托盘是唯一找回入口，必须启用）。移植自 deepseek_app。
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     use tauri::menu::{MenuBuilder, MenuItemBuilder};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -760,11 +784,8 @@ pub fn run() {
         ])
         .setup(|app| {
             let window = build_main_window(app)?;
-            #[cfg(target_os = "macos")]
-            {
-                build_menu(app)?;
-                build_tray(app)?;
-            }
+            build_menu(app)?;
+            build_tray(app)?;
             // 页面 emit 的主题事件（检测脚本经 invoke/emit 双通道回报）：
             // 主线程应用原生外观。此处只收页面→后端方向的 "theme-changed"。
             let handle = app.handle().clone();
@@ -795,27 +816,6 @@ pub fn run() {
                     let state = poll_handle.state::<AppState>();
                     let snapshot = state.state.lock().unwrap().clone();
                     mac_titlebar::update_status_on_main(&poll_handle, snapshot.status.clone());
-                });
-            }
-            // 临时诊断：探测 terminal webview 的页面加载与 JS 状态。
-            {
-                let diag_handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(4));
-                    if let Some(t) = diag_handle.get_webview("terminal") {
-                        let _ = t.eval(
-                            "document.title = 'TI:' + String(!!window.__TAURI_INTERNALS__) + ':' + String(typeof window.Terminal)",
-                        );
-                    }
-                    for _ in 0..3 {
-                        std::thread::sleep(Duration::from_millis(1500));
-                        if let Some(t) = diag_handle.get_webview("terminal") {
-                            eprintln!(
-                                "[diag-terminal] url={:?}",
-                                t.url().map(|u| u.to_string()).unwrap_or_default()
-                            );
-                        }
-                    }
                 });
             }
             start_dsh(app.handle());
