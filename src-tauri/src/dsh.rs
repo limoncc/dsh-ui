@@ -247,8 +247,9 @@ pub struct DshConfig {
     pub stdin_pipe: bool,
 }
 
-/// 生产 wrapper 脚本：后台启动 dsh，stdin EOF（APP 死亡）时杀掉它。
+/// 生产 wrapper 脚本（Unix）：后台启动 dsh，stdin EOF（APP 死亡）时杀掉它。
 /// 这让「退出 APP 必关 dsh」不依赖任何退出回调——连 kill -9 都覆盖。
+#[cfg(unix)]
 pub const DSH_WRAPPER_SCRIPT: &str = r#"
 "$1" web --no-open --port 0 &
 pid=$!
@@ -258,7 +259,8 @@ wait "$pid"
 "#;
 
 impl DshConfig {
-    /// 生产配置：经 stdin 守护 wrapper 启动 dsh，`--port 0` 由 OS 选空闲端口。
+    /// 生产配置（Unix）：经 stdin 守护 wrapper 启动 dsh，`--port 0` 由 OS 选空闲端口。
+    #[cfg(unix)]
     pub fn real(dsh: &Path, child_path: Option<String>, boot_timeout: Duration) -> Self {
         DshConfig {
             program: PathBuf::from("/bin/sh"),
@@ -273,6 +275,32 @@ impl DshConfig {
             kill_grace: Duration::from_secs(3),
             log_file: log_dir().map(|dir| dir.join("dsh.log")),
             stdin_pipe: true,
+        }
+    }
+
+    /// 生产配置（Windows）：经 `cmd /C` 直启 dsh（npm 的 .cmd shim 不能被
+    /// CreateProcess 裸执行）。防孤儿由 Job Object 承担（spawn 时关联，
+    /// APP 死 → 句柄关闭 → OS 杀 job 内进程），无需 stdin wrapper。
+    #[cfg(windows)]
+    pub fn real(dsh: &Path, child_path: Option<String>, boot_timeout: Duration) -> Self {
+        DshConfig {
+            program: PathBuf::from("cmd"),
+            args: [
+                "/C",
+                &dsh.display().to_string(),
+                "web",
+                "--no-open",
+                "--port",
+                "0",
+            ]
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect(),
+            child_path,
+            boot_timeout,
+            kill_grace: Duration::from_secs(3),
+            log_file: log_dir().map(|dir| dir.join("dsh.log")),
+            stdin_pipe: false,
         }
     }
 }
@@ -298,6 +326,9 @@ struct Shared {
     stderr_tail: Mutex<Vec<u8>>,
     /// 子进程 stdin 写端（stdin_pipe 时持有；drop 即关闭管道）。
     stdin_writer: Mutex<Option<std::process::ChildStdin>>,
+    /// Windows 防孤儿 Job（drop/进程死亡时 OS 自动杀 job 内 dsh）。
+    #[cfg(windows)]
+    job: Mutex<Option<job_object::KillOnCloseJob>>,
 }
 
 /// dsh 子进程句柄：spawn 后由内部线程驱动事件，`stop` 负责进程组终止。
@@ -335,11 +366,15 @@ impl DshProcess {
         }
 
         let mut child = command.spawn()?;
-        // process_group(0) 使子进程成为新组长：pgid == pid，整组 kill 用 -pid。
         let pid = child.id() as i32;
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
         let stdin_writer = child.stdin.take();
+
+        // Windows 防孤儿：关联 Job（APP 死 → 句柄关闭 → OS 杀 dsh）。
+        // 关联失败（如进程已在其他 job 中）降级为仅主动清理，不阻断启动。
+        #[cfg(windows)]
+        let job = Mutex::new(job_object::attach(child.id()).ok());
 
         // 日志文件（truncate 每次启动）；目录不存在时放弃落盘，不影响运行。
         let log_file = config.log_file.as_deref().and_then(|path| {
@@ -357,6 +392,8 @@ impl DshProcess {
             exit_reported: AtomicBool::new(false),
             stderr_tail: Mutex::new(Vec::new()),
             stdin_writer: Mutex::new(stdin_writer),
+            #[cfg(windows)]
+            job,
         });
 
         // stdout 线程：解析就绪行；EOF 后等进程真正退出并报告一次。
@@ -461,8 +498,8 @@ fn request_stop(shared: &Arc<Shared>, pid: i32, kill_grace: Duration) {
     if shared.stop_requested.swap(true, Ordering::SeqCst) {
         return;
     }
-    kill_process_group(pid, libc::SIGTERM);
-    // 看门狗：宽限期内仍存活则升级 SIGKILL。
+    terminate_child(pid, false);
+    // 看门狗：宽限期内仍存活则升级强杀。
     let probe = Arc::downgrade(shared);
     thread::spawn(move || {
         let deadline = Instant::now() + kill_grace;
@@ -482,14 +519,95 @@ fn request_stop(shared: &Arc<Shared>, pid: i32, kill_grace: Duration) {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        kill_process_group(pid, libc::SIGKILL);
+        terminate_child(pid, true);
     });
 }
 
-/// 向进程组发信号：组长 pid 取负即组 id；目标已死时 kill 返回 ESRCH，忽略。
-fn kill_process_group(pid: i32, sig: i32) {
+/// 终止子进程：unix 向进程组发信号（组长 pid 取负即组 id，目标已死时
+/// kill 返回 ESRCH 忽略）；windows 用 taskkill /T 杀整棵进程树。
+#[cfg(unix)]
+fn terminate_child(pid: i32, force: bool) {
+    let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
     unsafe {
         libc::kill(-pid, sig);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_child(pid: i32, _force: bool) {
+    // /T 杀进程树（dsh 可能有子进程），/F 强制；进程已死时 taskkill 报错，忽略。
+    let _ = std::process::Command::new("taskkill")
+        .args(["/T", "/PID", &pid.to_string(), "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Windows 防孤儿：Job Object —— 关联子进程后，本进程死亡（含被强杀，
+/// OS 回收全部句柄）即触发 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE，自动杀掉
+/// job 内所有进程。等价于 Unix 的 stdin-EOF 守护，覆盖「强杀必关 dsh」。
+#[cfg(windows)]
+mod job_object {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    fn io_err(error: windows::core::Error) -> std::io::Error {
+        std::io::Error::other(error.to_string())
+    }
+
+    /// 持有 kill-on-close Job；Drop（含进程被强杀时 OS 回收）→ 杀 job 内进程。
+    pub struct KillOnCloseJob(HANDLE);
+
+    /// 创建 job、设置「句柄关闭即杀」标志、把 pid 关联进 job。
+    pub fn attach(pid: u32) -> std::io::Result<KillOnCloseJob> {
+        unsafe {
+            let job = CreateJobObjectW(None, None).map_err(io_err)?;
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &raw mut info as *const _,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .map_err(|e| {
+                use windows::Win32::System::JobObjects::CloseHandle;
+                let _ = CloseHandle(job);
+                io_err(e)
+            })?;
+            let process =
+                OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid).map_err(|e| {
+                    use windows::Win32::System::JobObjects::CloseHandle;
+                    let _ = CloseHandle(job);
+                    io_err(e)
+                })?;
+            AssignProcessToJobObject(job, process).map_err(|e| {
+                use windows::Win32::System::JobObjects::CloseHandle;
+                let _ = CloseHandle(process);
+                let _ = CloseHandle(job);
+                io_err(e)
+            })?;
+            // job 已持有进程引用，process 句柄用完即关。
+            use windows::Win32::System::JobObjects::CloseHandle;
+            let _ = CloseHandle(process);
+            Ok(KillOnCloseJob(job))
+        }
+    }
+
+    impl Drop for KillOnCloseJob {
+        fn drop(&mut self) {
+            use windows::Win32::System::JobObjects::CloseHandle;
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
     }
 }
 
@@ -1024,7 +1142,7 @@ mod process_tests {
 mod stdin_guard_tests {
     use super::{DshConfig, DshEvent, DshProcess};
     use std::path::PathBuf;
-    use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+    use std::sync::mpsc::{channel, RecvTimeoutError};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
