@@ -860,7 +860,8 @@ pub fn run() {
             get_theme,
         ])
         .setup(|app| {
-            let window = build_main_window(app)?;
+            // _window：macOS 用它挂标题栏；Windows 下 mac_titlebar 是 cfg 掉的，仅持有。
+            let _window = build_main_window(app)?;
             build_menu(app)?;
             build_tray(app)?;
             // 页面 emit 的主题事件（检测脚本经 invoke/emit 双通道回报）：
@@ -883,7 +884,7 @@ pub fn run() {
             apply_window_theme(app.handle(), "light");
             // 原生标题栏按钮（状态/日志/设置/终端，右侧与红绿灯同行）。
             #[cfg(target_os = "macos")]
-            mac_titlebar::setup(&window)?;
+            mac_titlebar::setup(_window)?;
             // 标题栏状态按钮轮询（原生更新，不依赖 webview）。
             #[cfg(target_os = "macos")]
             {

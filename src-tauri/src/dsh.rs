@@ -378,8 +378,10 @@ struct Shared {
     stderr_tail: Mutex<Vec<u8>>,
     /// 子进程 stdin 写端（stdin_pipe 时持有；drop 即关闭管道）。
     stdin_writer: Mutex<Option<std::process::ChildStdin>>,
-    /// Windows 防孤儿 Job（drop/进程死亡时 OS 自动杀 job 内 dsh）。
+    /// Windows 防孤儿 Job：**仅持有**——无读取方，靠 Drop 关闭句柄触发
+    /// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE（APP 死 → OS 杀 job 内 dsh）。
     #[cfg(windows)]
+    #[allow(dead_code)]
     job: Mutex<Option<job_object::KillOnCloseJob>>,
 }
 
