@@ -7,7 +7,7 @@
 
 ## 前提
 
-- macOS
+- macOS 或 Windows
 - Node.js ≥ 22（`dsh` 依赖 `node:sqlite`）
 - DeepSeek Harness CLI：`npm i -g @deepseek-ai/dsh`
 
@@ -16,7 +16,8 @@
 ## 功能
 
 - 自动拉起/重启 `dsh` 后端；崩溃后可一键重启
-- **原生标题栏按钮**（红绿灯右侧）：`🟢 状态`（点击重启 dsh）、日志、设置
+- **标题栏按钮**：macOS 为原生标题栏按钮（红绿灯右侧）；Windows 为顶部 32px 工具栏
+  webview（状态 / 日志 / 设置），均含 `🟢 状态`（点击重启 dsh）
 - **设置窗口**：自定义 dsh / node 路径（留空 = 自动探测），支持即时测试与保存后自动重启
   （持久化在 `~/Library/Application Support/com.dsh.ui/config.json`）
 - **安装指引**：缺少 Node/dsh 或版本过低时，按错误类型给出分步安装命令（带复制按钮）
@@ -37,8 +38,15 @@ npm run dev      # tauri dev
 ## 打包
 
 ```sh
-npm run build    # 产出 .app 与 .dmg（src-tauri/target/release/bundle/）
+npm run build    # 产出 .app/.dmg（macOS）与 nsis .exe（Windows）
+                 # 位于 src-tauri/target/release/bundle/
 ```
+
+## CI
+
+GitHub Actions（push main 自动触发）：
+- `build-macos.yml`：macos-14 arm64 → ad-hoc 签名 + DMG（`macos-arm64` artifact）
+- `build-windows.yml`：windows-latest → NSIS 安装器（`windows-installer` artifact）
 
 ## 测试
 
