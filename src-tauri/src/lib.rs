@@ -429,7 +429,8 @@ pub(crate) fn open_settings_window(app: &tauri::AppHandle) -> Result<(), String>
 }
 
 /// Tauri 命令：打开设置窗口（已存在则聚焦）。
-#[tauri::command]
+/// async：Windows/WebView2 上同步 command 内创建 window 会死锁（chat-app 已验证的约束）。
+#[tauri::command(async)]
 fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
     open_settings_window(&app)
 }
