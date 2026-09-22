@@ -608,7 +608,7 @@ fn terminate_child(pid: i32, _force: bool) {
 /// job 内所有进程。等价于 Unix 的 stdin-EOF 守护，覆盖「强杀必关 dsh」。
 #[cfg(windows)]
 mod job_object {
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -638,32 +638,32 @@ mod job_object {
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
             .map_err(|e| {
-                use windows::Win32::System::JobObjects::CloseHandle;
                 let _ = CloseHandle(job);
                 io_err(e)
             })?;
             let process =
                 OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid).map_err(|e| {
-                    use windows::Win32::System::JobObjects::CloseHandle;
                     let _ = CloseHandle(job);
                     io_err(e)
                 })?;
             AssignProcessToJobObject(job, process).map_err(|e| {
-                use windows::Win32::System::JobObjects::CloseHandle;
                 let _ = CloseHandle(process);
                 let _ = CloseHandle(job);
                 io_err(e)
             })?;
             // job 已持有进程引用，process 句柄用完即关。
-            use windows::Win32::System::JobObjects::CloseHandle;
             let _ = CloseHandle(process);
             Ok(KillOnCloseJob(job))
         }
     }
 
+    // HANDLE 是裸指针包装（windows 0.58 不自动 Send/Sync），但 Job 内核句柄
+    // 可跨线程引用；实际访问全部发生在 Mutex 保护下（Drop 只关闭一次），安全。
+    unsafe impl Send for KillOnCloseJob {}
+    unsafe impl Sync for KillOnCloseJob {}
+
     impl Drop for KillOnCloseJob {
         fn drop(&mut self) {
-            use windows::Win32::System::JobObjects::CloseHandle;
             unsafe {
                 let _ = CloseHandle(self.0);
             }

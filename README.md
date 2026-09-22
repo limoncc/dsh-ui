@@ -64,3 +64,24 @@ src-tauri/src/
   mac_titlebar.rs   macOS 原生标题栏按钮（状态/日志/设置/终端）
   lib.rs            窗口/菜单/托盘/布局装配与 Tauri 命令
 ```
+安装dsh
+```shell
+npm_config_registry=https://registry.npmmirror.com npm i @deepseek-ai/dsh -g
+```
+
+安装插件前置配置
+```
+vim ~/.dsh/profiles/web/pnpm-workspace.yaml
+```
+
+粘贴如下底代码退出，不会使用vim就手动编辑
+```yaml
+allowBuilds:
+  "dsh-better-sidebar@https://codeload.github.com/omdsh-dev/DSH-better-sidebar/tar.gz/754974afeaf5c0aa310d6104dfd892ef56a6297d": true
+  node-pty@1.1.0: true
+```
+
+安装插件
+```
+npm_config_registry=https://registry.npmmirror.com dsh plugin --profile web add github:omdsh-dev/DSH-better-sidebar#v0.19.0
+```

@@ -315,7 +315,8 @@ fn open_external(url: &str) {
     #[cfg(target_os = "windows")]
     {
         use windows::core::{w, HSTRING};
-        use windows::Win32::UI::Shell::{ShellExecuteW, SW_SHOWNORMAL};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
         let _ = unsafe {
             ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL)
         };
