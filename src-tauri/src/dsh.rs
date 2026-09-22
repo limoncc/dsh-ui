@@ -13,10 +13,38 @@ use std::time::{Duration, Instant};
 /// dsh 要求的最低 Node.js major 版本（用到 `node:sqlite` 等）。
 pub const MIN_NODE_MAJOR: u32 = 22;
 
-/// GUI 环境（Finder 启动）常见但可能不在继承 PATH 里的候选目录。
+/// GUI 环境（Finder 启动）常见但可能不在继承 PATH 里的候选目录（Unix）。
+#[cfg(unix)]
 pub const EXTRA_BIN_DIRS: &[&str] = &["/usr/local/bin", "/opt/homebrew/bin"];
 
+/// GUI 环境常见候选目录（跨平台入口）：Unix 为 Homebrew 等固定路径；
+/// Windows 从 %APPDATA%\npm（npm 全局 bin）与 Node 安装目录展开。
+pub fn extra_bin_dirs() -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        EXTRA_BIN_DIRS.iter().map(PathBuf::from).collect()
+    }
+    #[cfg(windows)]
+    {
+        let mut dirs = Vec::new();
+        // npm 全局安装的 dsh.cmd/node 命令目录。
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            dirs.push(PathBuf::from(appdata).join("npm"));
+        }
+        // 官方 MSI 安装的 Node。
+        for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(root) = std::env::var_os(var) {
+                dirs.push(PathBuf::from(root).join("nodejs"));
+            }
+        }
+        dirs
+    }
+}
+
 /// 在 `search_dirs` 中按序查找可执行文件 `name`，命中第一个含执行权限的常规文件。
+///
+/// Windows 上裸名（`dsh`）按 PATHEXT 常见扩展名逐个尝试
+/// （`dsh.cmd`/`dsh.exe`/…，npm 全局命令是 .cmd shim）。
 pub fn find_executable(name: &str, search_dirs: &[PathBuf]) -> Option<PathBuf> {
     #[cfg(unix)]
     fn is_executable(file: &std::path::Path) -> bool {
@@ -30,25 +58,41 @@ pub fn find_executable(name: &str, search_dirs: &[PathBuf]) -> Option<PathBuf> {
         std::fs::metadata(file).map(|meta| meta.is_file()).unwrap_or(false)
     }
 
-    search_dirs
-        .iter()
-        .map(|dir| dir.join(name))
-        .find(|file| is_executable(file))
+    /// 候选文件名（unix 仅裸名；windows 裸名 + PATHEXT 扩展名）。
+    #[cfg(unix)]
+    fn candidate_names(name: &str) -> Vec<String> {
+        vec![name.to_string()]
+    }
+    #[cfg(windows)]
+    fn candidate_names(name: &str) -> Vec<String> {
+        let mut names = vec![name.to_string()];
+        for ext in [".cmd", ".exe", ".bat", ".com"] {
+            names.push(format!("{name}{ext}"));
+        }
+        names
+    }
+
+    // 目录外层、候选名内层：PATH 查找语义（先到的目录优先）。
+    search_dirs.iter().find_map(|dir| {
+        candidate_names(name).iter().find_map(|candidate| {
+            let file = dir.join(candidate);
+            is_executable(&file).then_some(file)
+        })
+    })
 }
 
-/// 把继承的 `PATH` 环境变量拆成候选目录（空串或空缺返回空表，跳过空段）。
+/// 把继承的 `PATH` 环境变量拆成候选目录（跨平台分隔符：unix `:` / win `;`，
+/// 修掉 Windows 下 `C:` 盘符被冒号切碎的问题；跳过空段）。
 pub fn dirs_from_path(path_env: &str) -> Vec<PathBuf> {
-    path_env
-        .split(':')
-        .filter(|segment| !segment.is_empty())
-        .map(PathBuf::from)
+    std::env::split_paths(std::ffi::OsStr::new(path_env))
+        .filter(|path| !path.as_os_str().is_empty())
         .collect()
 }
 
 /// 构造探测 dsh/node 的目录序列：继承 PATH 优先，其后补 GUI 常见目录。
 pub fn search_dirs(path_env: Option<&str>) -> Vec<PathBuf> {
     let mut dirs = path_env.map(dirs_from_path).unwrap_or_default();
-    dirs.extend(EXTRA_BIN_DIRS.iter().map(PathBuf::from));
+    dirs.extend(extra_bin_dirs());
     dirs
 }
 
@@ -156,8 +200,7 @@ pub fn normalize_theme(theme: &str) -> &'static str {
 
 /// 按设置 override（优先）与 PATH/GUI 常见目录探测 dsh 与 node，并校验 node 版本。
 pub fn detect_environment(path_env: Option<&str>, overrides: &EnvOverrides) -> EnvCheck {
-    let fallbacks: Vec<PathBuf> = EXTRA_BIN_DIRS.iter().map(PathBuf::from).collect();
-    detect_environment_with_dirs(path_env, &fallbacks, overrides)
+    detect_environment_with_dirs(path_env, &extra_bin_dirs(), overrides)
 }
 
 /// [`detect_environment`] 的可注入版本：`extra_dirs` 替代 GUI 常见目录，供测试使用。
@@ -197,13 +240,22 @@ pub fn detect_environment_with_dirs(
     }
 }
 
-/// 子进程 PATH：探测命中目录放最前，保证 `dsh` shebang 的 `env node` 能找到同一 node。
+/// 子进程 PATH：探测命中目录放最前（unix 保证 `dsh` shebang 的 `env node`
+/// 能找到同一 node），用平台分隔符拼接（`join_paths`：unix `:` / win `;`）。
 pub fn child_path(dirs: &[PathBuf], inherited: Option<&str>) -> String {
-    let mut parts: Vec<String> = dirs.iter().map(|dir| dir.display().to_string()).collect();
+    let mut paths: Vec<PathBuf> = dirs.to_vec();
     if let Some(inherited) = inherited {
-        parts.push(inherited.to_string());
+        // inherited 是平台分隔的整串，拆段并入保证输出是规范 join_paths 形式。
+        paths.extend(dirs_from_path(inherited));
     }
-    parts.join(":")
+    match std::env::join_paths(&paths) {
+        Ok(joined) => joined.to_string_lossy().into_owned(),
+        Err(_) => paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(if cfg!(windows) { ";" } else { ":" }),
+    }
 }
 
 /// dsh 就绪行的固定前缀（`packages/bundle/web-app` announceReady 打印）。
@@ -489,9 +541,17 @@ impl DshProcess {
 /// stderr 尾部环形缓冲上限。
 pub const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
-/// dsh 日志目录：`~/Library/Logs/dsh-ui`（macOS 惯例，跟随 HOME）。
+/// dsh 日志目录：macOS `~/Library/Logs/dsh-ui`（跟随 HOME）；
+/// Windows `%LOCALAPPDATA%\dsh-ui\logs`（GUI 下 LOCALAPPDATA 比 HOME 可靠）。
+#[cfg(unix)]
 pub fn log_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Logs/dsh-ui"))
+}
+
+#[cfg(windows)]
+pub fn log_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|dir| PathBuf::from(dir).join("dsh-ui").join("logs"))
 }
 
 fn request_stop(shared: &Arc<Shared>, pid: i32, kill_grace: Duration) {
@@ -687,6 +747,7 @@ mod tests {
         assert_eq!(find_executable("dsh", &dirs), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn dirs_from_path_splits_on_colon_and_skips_empty_segments() {
         let dirs = dirs_from_path("/a:/b::/c:");
@@ -698,6 +759,7 @@ mod tests {
         assert!(dirs_from_path("").is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn search_dirs_appends_gui_fallback_dirs_after_inherited_path() {
         let dirs = search_dirs(Some("/a:/b"));
@@ -712,6 +774,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn search_dirs_without_path_env_still_has_fallbacks() {
         assert_eq!(
@@ -743,6 +806,7 @@ mod tests {
         assert!(!node_version_ok(MIN_NODE_MAJOR - 1));
     }
 
+    #[cfg(unix)]
     #[test]
     fn child_path_puts_probe_dirs_first_then_inherited() {
         let dirs = vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/opt/homebrew/bin")];
@@ -752,10 +816,51 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn child_path_without_inherited_is_probe_dirs_only() {
         let dirs = vec![PathBuf::from("/usr/local/bin")];
         assert_eq!(child_path(&dirs, None), "/usr/local/bin");
+    }
+
+    /// 跨平台：join_paths 生成的字符串必须能被 dirs_from_path 还原
+    /// （Windows 上分隔符是 `;`，用 `:` 拆分会把整串当一段 → 守护 split_paths 化）。
+    #[test]
+    fn dirs_from_path_roundtrips_join_paths() {
+        let original = vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")];
+        let joined = std::env::join_paths(&original).expect("join_paths");
+        let parsed = dirs_from_path(&joined.to_string_lossy());
+        assert_eq!(parsed, original);
+    }
+
+    /// child_path 输出必须是平台分隔符拼接（与 join_paths 一致）。
+    #[test]
+    fn child_path_matches_join_paths_format() {
+        let dirs = vec![PathBuf::from("/probe-a"), PathBuf::from("/probe-b")];
+        let expected =
+            std::env::join_paths(["/probe-a", "/probe-b", "/inherited"]).expect("join");
+        assert_eq!(
+            child_path(&dirs, Some("/inherited")),
+            expected.to_string_lossy()
+        );
+    }
+
+    /// Windows：裸名探测需按 PATHEXT 逐个扩展名尝试（dsh → dsh.cmd 等）。
+    #[cfg(windows)]
+    #[test]
+    fn find_executable_windows_tries_pathext_variants() {
+        let dir = TempDir::new("pathext");
+        dir.plain_file("dsh.cmd"); // 存在但先测裸名不命中
+        // 裸名 `dsh` 不存在，但 PATHEXT 变体 dsh.cmd 存在 → 应命中
+        assert_eq!(find_executable("dsh", &[dir.path()]), Some(dir.path().join("dsh.cmd")));
+    }
+
+    /// Windows：日志目录走 %LOCALAPPDATA%\dsh-ui\logs。
+    #[cfg(windows)]
+    #[test]
+    fn log_dir_windows_uses_local_appdata() {
+        let dir = log_dir().expect("LOCALAPPDATA must be set on windows");
+        assert!(dir.to_string_lossy().contains("dsh-ui"));
     }
 
     #[test]
