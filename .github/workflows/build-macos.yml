@@ -3,7 +3,11 @@ name: Build macOS
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -51,3 +55,15 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: dsh-ui_${{ matrix.artifact }}.dmg
+
+      # tag 构建（v*）：把 DMG 挂到 GitHub Release，Release 页直接下载。
+      # Release 未创建时兜底创建（两 job 并发时吞掉 already_exists 失败）。
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "dsh-ui $GITHUB_REF_NAME" \
+            || true
+          gh release upload "$GITHUB_REF_NAME" "dsh-ui_${{ matrix.artifact }}.dmg" --clobber
